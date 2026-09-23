@@ -54,18 +54,18 @@ promotion/invalidation logic yourself.
 
 ## Install
 
-The module is currently named `strata` with no host prefix, which only
-resolves for code within this same module. Once this repo is pushed
-somewhere `go get` can reach (e.g. `github.com/<you>/strata`), update
-`go.mod`'s module line and the import path below to match.
-
 ```
-go get strata
+go get github.com/otmaneki/strata/src
 ```
 
 ```go
-import "strata"
+import "github.com/otmaneki/strata/src"
 ```
+
+The Go source lives under `src/`, but the package itself is still named
+`strata` — so despite the import path ending in `/src`, code that imports
+it refers to it as `strata.NewTieredCache(...)`, `strata.Cache`, etc., same
+as everywhere else in this README.
 
 ## Usage
 
@@ -146,7 +146,7 @@ tc := strata.NewTieredCache(redisClient, time.Minute, time.Hour,
 )
 ```
 
-More runnable examples for every option live in `example_test.go`.
+More runnable examples for every option live in `src/example_test.go`.
 
 ## How it works
 

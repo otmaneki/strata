@@ -1,4 +1,4 @@
-module strata
+module github.com/otmaneki/strata
 
 go 1.27.0
 

@@ -361,7 +361,7 @@ formatters:
       # Put your own module's imports in their own group.
       # Replace with your module path.
       local-prefixes:
-        - strata
+        - github.com/otmaneki/strata
 
     # golines:
     #   max-len: 120
