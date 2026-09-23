@@ -1,0 +1,394 @@
+# golangci-lint configuration (v2 format)
+# Docs: https://golangci-lint.run/docs/configuration/file/
+#
+# Principles:
+#   1. Every enabled linter should catch something the others don't. Overlap
+#      means duplicate reports and duplicate //nolint directives.
+#   2. Noisy checks start disabled (bottom of `enable`). Turn them on once the
+#      main set is green, one at a time, and measure the //nolint cost.
+#   3. Every exclusion says why. If you can't explain it, delete it.
+#
+# Usage:
+#   golangci-lint config verify   # validate this file against the schema
+#   golangci-lint run             # lint
+#   golangci-lint run --fix       # lint + autofix
+#   golangci-lint fmt             # apply formatters
+#
+# Adopting on an existing codebase: uncomment `new-from-merge-base` under
+# `issues` so only new code is held to this standard.
+
+version: "2"
+
+run:
+  # v2 has no timeout by default. A bound makes a hung CI run fail fast.
+  timeout: 5m
+  build-tags:
+    - integration
+  tests: true
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+
+  enable:
+    # ---- Correctness ---------------------------------------------------------
+    - asasalint                 # []any passed to variadic ...any
+    - bidichk                   # "Trojan Source" bidi characters
+    - bodyclose                 # unclosed HTTP response bodies
+    - durationcheck             # duration * duration
+    - errchkjson                # json.Marshal errors: unchecked or impossible
+    - errorlint                 # %v instead of %w, == instead of errors.Is/As
+    - exhaustive                # missing cases in enum switches
+    - fatcontext                # context re-wrapped inside a loop
+    - gocheckcompilerdirectives # malformed //go: directives (silently ignored)
+    - makezero                  # append to a slice made with non-zero length
+    - musttag                   # (un)marshalled structs missing field tags
+    - nilerr                    # return nil while err != nil
+    - nilnesserr                # return err where err is known to be nil
+    - nilnil                    # return nil, nil from (*T, error)
+    - noctx                     # HTTP / SQL calls without a context
+    - recvcheck                 # mixed pointer and value receivers on a type
+    - reassign                  # reassigning other packages' variables
+    - rowserrcheck              # missing rows.Err() after iteration
+    - spancheck                 # OpenTelemetry spans not ended / errors not recorded
+    - sqlclosecheck             # unclosed sql.Rows / sql.Stmt
+    - testifylint               # testify misuse
+    - usetesting                # t.TempDir / t.Setenv / t.Context
+
+    # ---- Security ------------------------------------------------------------
+    - gosec
+
+    # ---- Readability / idiom -------------------------------------------------
+    - copyloopvar               # redundant loop-var copies (Go 1.22+)
+    - errname                   # ErrFoo vars, FooError types
+    - exptostd                  # golang.org/x/exp helpers now in the stdlib
+    - gocritic
+    - godot                     # declaration comments end in a period
+    - iface                     # redundant / identical interfaces
+    - intrange                  # for i := range n (Go 1.22+)
+    - misspell
+    - nakedret                  # naked returns in long functions
+    - nolintlint                # //nolint must be specific and explained
+    - perfsprint                # fmt.Sprintf where strconv etc. suffices
+    - predeclared               # shadowing len, cap, new, ...
+    - revive
+    - unconvert
+    - unparam                   # unused / constant function parameters
+    - usestdlibvars             # http.MethodGet over "GET", etc.
+    - wastedassign
+    - whitespace
+
+    # ---- Complexity ----------------------------------------------------------
+    # Two linters, not five: cyclop, nestif and maintidx flag the same
+    # functions as these, just with different numbers.
+    - gocognit                  # how hard is it to read
+    - funlen                    # how long is it
+
+    # ---- Structure / API -----------------------------------------------------
+    - containedctx              # context.Context stored in a struct
+    - depguard                  # forbidden imports, configured below
+    - forbidigo                 # forbidden calls, configured below
+    - gochecknoinits            # init() side effects
+    - goconst                   # repeated strings -> constants
+    - interfacebloat            # interfaces with too many methods
+    # - mnd                       # magic numbers
+
+    # ---- Modules -------------------------------------------------------------
+    - gomoddirectives           # replace / retract in go.mod
+
+    # --------------------------------------------------------------------------
+    # Opt-in: useful but noisy. Enable one at a time once the above is green.
+    # --------------------------------------------------------------------------
+    # - contextcheck    # non-inherited contexts; false positives on detached work
+    # - dupl            # duplicate blocks; fires on table tests
+    # - err113          # no dynamic errors.New outside package vars
+    # - exhaustruct     # every struct field set; very noisy
+    # - ireturn         # accept interfaces, return structs
+    # - paralleltest    # every test calls t.Parallel()
+    # - prealloc        # preallocate slices
+    # - sloglint        # consistent log/slog usage, if you've standardised on slog
+    # - tagliatelle     # struct tag naming conventions
+    # - testpackage     # tests in package foo_test
+    # - varnamelen      # short names; needs heavy tuning
+    # - wrapcheck       # wrap errors crossing package boundaries
+
+  settings:
+    errcheck:
+      # Unchecked type assertions panic at runtime.
+      check-type-assertions: true
+      # Left false on purpose: `_ = f.Close()` is the idiomatic, greppable way
+      # to say "I'm ignoring this error". Flagging it just forces a //nolint.
+      check-blank: false
+      exclude-functions:
+        # Close on a read path is not actionable. The type must match the
+        # DECLARED type, hence both interfaces.
+        - (io.ReadCloser).Close
+        - (io.Closer).Close
+        # Rollback after a successful Commit is a no-op.
+        - (*database/sql.Tx).Rollback
+        # (*os.File).Close is deliberately NOT excluded: a failed close after
+        # writing means a failed flush, i.e. silent data loss.
+
+    govet:
+      enable-all: true
+      disable:
+        # Reorders struct fields for memory; hurts grouping. Hot structs only.
+        - fieldalignment
+        # Fires on nearly every `if err := ...; err != nil` that shadows an
+        # outer err. Real shadowing bugs are rare enough not to be worth it.
+        - shadow
+
+    staticcheck:
+      checks:
+        - all
+        # Package and exported-symbol comments are owned by revive below.
+        # Leaving both on reports every missing comment twice.
+        - -ST1000
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # Naming is owned by revive's var-naming.
+        - -ST1003
+        # "Omit embedded field from selector": explicit is often clearer.
+        - -QF1008
+
+    revive:
+      severity: warning
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+          arguments:
+            - allowTypesBefore: "*testing.T"
+        - name: context-keys-type
+        - name: dot-imports
+        - name: early-return
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        # Doc comments on exported symbols. For an application (not a
+        # library) you may prefer to disable this rule; do it here rather
+        # than via the `comments` exclusion preset, which silences it
+        # without saying so.
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+            - sayRepetitiveInsteadOfStutters
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: use-any
+        - name: var-declaration
+        - name: var-naming
+        - name: waitgroup-by-value
+        # Not enabled:
+        #   package-comments  - staticcheck ST1000 is also off; pick one if wanted.
+        #   unused-parameter  - unparam covers this with fewer false positives
+        #                       on interface implementations.
+        #   unused-receiver   - mostly flags methods that exist to satisfy an
+        #                       interface.
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+        - opinionated
+      disabled-checks:
+        - whyNoLint     # nolintlint does this
+        - hugeParam     # fires on intentional value receivers
+        - rangeValCopy  # same; enable per package if profiling says so
+
+    gosec:
+      excludes:
+        - G104  # unhandled errors; duplicates errcheck
+        - G115  # int conversion overflow; very high false-positive rate
+      # Report only findings gosec itself rates medium or higher.
+      severity: medium
+      confidence: medium
+
+    exhaustive:
+      # A `default:` clause handles the remaining cases.
+      default-signifies-exhaustive: true
+      # Switches only. Map literals keyed by enum are rarely meant to be total.
+      check:
+        - switch
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+      # Numbers are left to mnd, so the same literal isn't reported twice.
+      numbers: false
+
+    mnd:
+      # `assign` and `case` are the noisiest checks, so they're left out.
+      checks:
+        - argument
+        - condition
+        - operation
+        - return
+      ignored-numbers:
+        - "0"
+        - "1"
+        - "2"
+        - "10"
+        - "100"
+      # These are regexes, so anchor them.
+      ignored-functions:
+        - ^strconv\.(Parse|Format|Append)
+        - ^make$
+        - ^time\.Duration$
+        # File modes like 0o644. gosec already checks the permissions.
+        - ^os\.(Chmod|Mkdir|MkdirAll|OpenFile|WriteFile)$
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    gocognit:
+      # 20 is generous; 15 is tight.
+      min-complexity: 25
+
+    funlen:
+      lines: 80
+      statements: 50
+      ignore-comments: true
+
+    nakedret:
+      max-func-lines: 20
+
+    interfacebloat:
+      max: 6
+
+    misspell:
+      locale: US
+
+    godot:
+      scope: declarations
+
+    depguard:
+      rules:
+        main:
+          list-mode: lax
+          deny:
+            - pkg: "github.com/pkg/errors"
+              desc: "Use the standard library errors package with %w."
+            - pkg: "math/rand$"
+              desc: "Use math/rand/v2. See https://go.dev/blog/randv2"
+            # io/ioutil is omitted: staticcheck SA1019 already flags it.
+            # Uncomment if you've standardised on log/slog:
+            # - pkg: "log$"
+            #   desc: "Use log/slog. See https://go.dev/blog/slog"
+
+    forbidigo:
+      analyze-types: true
+      exclude-godoc-examples: true
+      forbid:
+        - pattern: ^print(ln)?$
+          msg: "Use a logger, not the builtin print."
+        - pattern: ^fmt\.Print(f|ln)?$
+          msg: "Use a logger, or fmt.Fprint to an explicit writer."
+        # Legitimate panics (MustX constructors, truly unreachable states)
+        # should carry //nolint:forbidigo with a reason.
+        - pattern: ^panic$
+          msg: "Return an error instead of panicking in library code."
+
+  exclusions:
+    # `lax` matches the standard "Code generated ... DO NOT EDIT." header,
+    # which covers .pb.go, sqlc, stringer, mockgen etc.
+    generated: lax
+    # Report exclusion rules that no longer match anything.
+    warn-unused: true
+    presets:
+      # Known false positives (e.g. gosec on exec with variables).
+      - common-false-positives
+      # Deliberately NOT enabled:
+      #   comments           - would silence revive's `exported` rule.
+      #   std-error-handling - ignores errors from Close/Flush/Print; covered
+      #                        more precisely by errcheck.exclude-functions.
+      #   legacy             - v1 default exclusions, kept only for migration.
+
+    rules:
+      # Table-driven tests and fixtures are long, repetitive and full of
+      # literals by design. errcheck stays ON: an ignored error in test setup
+      # produces some of the most confusing failures there are.
+      - path: _test\.go
+        linters:
+          - funlen
+          - gocognit
+          - goconst
+          - gosec
+          - mnd
+          - noctx
+
+      # Program wiring may be long, may print, and may use init().
+      - path: (^|/)(main\.go$|cmd/)
+        linters:
+          - forbidigo
+          - funlen
+          - gochecknoinits
+
+      # Example for a migrations directory, if you have one. Left commented
+      # because warn-unused reports rules that match nothing.
+      # - path: migrations/
+      #   linters:
+      #     - goconst
+      #     - mnd
+
+    paths:
+      - third_party
+      - vendor
+
+formatters:
+  enable:
+    - gofumpt     # stricter superset of gofmt
+    - goimports   # add/remove and group imports
+    # - golines   # hard-wraps long lines; preferable to the lll linter
+
+  settings:
+    gofumpt:
+      extra-rules: true
+
+    goimports:
+      # Put your own module's imports in their own group.
+      # Replace with your module path.
+      local-prefixes:
+        - strata
+
+    # golines:
+    #   max-len: 120
+
+  exclusions:
+    generated: lax
+    paths:
+      - third_party
+      - vendor
+
+issues:
+  # Show everything. The defaults (50 per linter, 3 per identical issue) hide
+  # problems and make the count meaningless.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  # Only report issues introduced since branching from main. More robust than
+  # new-from-rev because it follows the actual merge base.
+  # new-from-merge-base: main
+
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+  sort-order:
+    - file
+    - linter
+    - severity
+  show-stats: true
