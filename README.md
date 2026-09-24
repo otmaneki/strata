@@ -55,17 +55,12 @@ promotion/invalidation logic yourself.
 ## Install
 
 ```
-go get github.com/otmaneki/strata/src
+go get github.com/otmaneki/strata
 ```
 
 ```go
-import "github.com/otmaneki/strata/src"
+import "github.com/otmaneki/strata"
 ```
-
-The Go source lives under `src/`, but the package itself is still named
-`strata` — so despite the import path ending in `/src`, code that imports
-it refers to it as `strata.NewTieredCache(...)`, `strata.Cache`, etc., same
-as everywhere else in this README.
 
 ## Usage
 
@@ -146,7 +141,7 @@ tc := strata.NewTieredCache(redisClient, time.Minute, time.Hour,
 )
 ```
 
-More runnable examples for every option live in `src/example_test.go`.
+More runnable examples for every option live in `example_test.go`.
 
 ## How it works
 

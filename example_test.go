@@ -2,6 +2,7 @@ package strata
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -83,6 +84,100 @@ func ExampleTieredCache_GetOrLoad() {
 	// otmane
 	// otmane
 	// loader calls: 1
+}
+
+// productFilters is a stand-in for the kind of struct a search/listing
+// endpoint builds from request query params — several fields that together
+// determine what to query for.
+type productFilters struct {
+	Category string
+	MinPrice int
+	InStock  bool
+}
+
+// cacheKey turns filters into a deterministic string key: same filters,
+// same key, every time. That's the only requirement GetOrLoad has for a
+// key — it's written out explicitly here (rather than, say, JSON-marshaling
+// the whole struct) so the key format doesn't silently change if a field
+// gets renamed or reordered later.
+func (f productFilters) cacheKey() string {
+	return fmt.Sprintf("products:category=%s:min_price=%d:in_stock=%t", f.Category, f.MinPrice, f.InStock)
+}
+
+// buildProductQuery is the "complex processing" step: turning a filter
+// struct into a SQL query and its arguments, the way you'd hand them to
+// database/sql's QueryContext. It just returns the query text here so the
+// example stays runnable without a real database.
+func buildProductQuery(f productFilters) (query string, args []any) {
+	query = "SELECT id, name, price FROM products WHERE category = ? AND price >= ?"
+	args = []any{f.Category, f.MinPrice}
+	if f.InStock {
+		query += " AND in_stock = true"
+	}
+	return query, args
+}
+
+// ExampleTieredCache_GetOrLoad_filters shows GetOrLoad's loader doing real
+// work instead of a trivial lookup: it's an ordinary closure, so it can
+// capture whatever it needs from the enclosing scope — here, a filters
+// struct and (in a real program) a *sql.DB — build a query from it, and
+// execute it. GetOrLoad doesn't know or care what's inside the loader; all
+// it needs is a key that's deterministic for the same filters, which is
+// exactly what filters.cacheKey() gives it. A second call with the same
+// filters is served from cache without building or running the query
+// again.
+//
+// If you want a reusable, typed function instead of calling GetOrLoad
+// inline at every call site — e.g. "listProducts(ctx, filters)" — wrap this
+// same loader with WithCache instead: it takes the filters struct as its
+// Args type directly, so keyFn and the query-building logic look the same,
+// just moved into WithCache's wiring instead of a call site.
+func ExampleTieredCache_GetOrLoad_filters() {
+	client, err := newExampleRedisClient()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer client.Close() //nolint:errcheck // example cleanup
+
+	tc := NewTieredCache(client, time.Minute, time.Minute)
+	defer tc.Close() //nolint:errcheck // example cleanup
+
+	ctx := context.Background()
+	filters := productFilters{Category: "shoes", MinPrice: 20, InStock: true}
+
+	queriesRun := 0
+	loadProducts := func(ctx context.Context) ([]byte, error) {
+		queriesRun++
+		query, args := buildProductQuery(filters)
+		fmt.Println("SQL:", query, args)
+		// A real implementation executes the query here, e.g.:
+		//   rows, err := db.QueryContext(ctx, query, args...)
+		// then scans rows into a slice and marshals that. This example
+		// fakes the result to stay runnable without a database.
+		return json.Marshal([]string{"sneaker", "boot"})
+	}
+
+	first, err := tc.GetOrLoad(ctx, filters.cacheKey(), loadProducts)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	second, err := tc.GetOrLoad(ctx, filters.cacheKey(), loadProducts)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	fmt.Println(string(first))
+	fmt.Println(string(second))
+	fmt.Println("queries run:", queriesRun)
+
+	// Output:
+	// SQL: SELECT id, name, price FROM products WHERE category = ? AND price >= ? AND in_stock = true [shoes 20]
+	// ["sneaker","boot"]
+	// ["sneaker","boot"]
+	// queries run: 1
 }
 
 // exampleUser is the payload used by ExampleGetOrLoad and ExampleWithCache
