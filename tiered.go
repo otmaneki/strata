@@ -25,7 +25,7 @@ const (
 // TieredCache is a two-tier cache: an in-process local cache in front of
 // redis, with pubsub-driven invalidation so a write on one node can evict
 // the stale copy cached on others (see SubscribeInvalidations). Either tier
-// can be disabled — see WithoutLocalCache and WithoutRedis — but not both.
+// can be disabled, but not both. See WithoutLocalCache and WithoutRedis.
 type TieredCache struct {
 	local     *localCache
 	redis     *redis.Client
@@ -36,18 +36,20 @@ type TieredCache struct {
 	localEnabled  bool
 	remoteEnabled bool
 
-	// observer receives failure notifications — see Observer. Defaults to
+	// observer receives failure notifications. See Observer for details. Defaults to
 	// NoopObserver; set via WithObserver.
 	observer Observer
 
 	sub *redis.PubSub
 
 	// localCacheMaxSize and localCacheEvictInterval size the local tier.
-	// They're read once, in NewTieredCache, to construct it — set via
+	// They're read once, in NewTieredCache, to construct it. Set via
 	// WithLocalCacheSize / WithLocalCacheEvictInterval, not directly.
 	localCacheMaxSize       int
 	localCacheEvictInterval time.Duration
 	codec                   Codec
+
+	stats tieredStats
 }
 
 // Option configures optional TieredCache behavior.
@@ -88,7 +90,7 @@ func WithoutLocalCache() Option {
 
 // WithoutRedis disables the redis tier: Get and Set only ever touch the
 // in-process local tier. This instance's cache is then invisible to, and
-// never invalidated by, any other instance — there's no cross-instance
+// never invalidated by, any other instance. There's no cross-instance
 // consistency at all, not even eventually. The redis client passed to
 // NewTieredCache may be nil in this mode; it's never dialed.
 func WithoutRedis() Option {
@@ -96,7 +98,7 @@ func WithoutRedis() Option {
 }
 
 // WithCodec registers a Codec used to transform values before they're
-// written to redis and after they're read back — e.g. to compress payloads
+// written to redis and after they're read back, e.g. to compress payloads
 // over the wire. It only applies to the redis tier: the local tier always
 // holds the original, decoded value, so a warm local Get never pays the
 // encode/decode cost. Without this option, values are stored as-is. No
@@ -108,7 +110,7 @@ func WithCodec(c Codec) Option {
 // NewTieredCache builds a TieredCache backed by rc: values promoted from
 // redis into the local tier are kept for localTTL, values written to redis
 // are kept for remoteTTL. It starts the local tier's background TTL
-// sweeper immediately, unless WithoutLocalCache is used — call Close when
+// sweeper immediately, unless WithoutLocalCache is used. Call Close when
 // done to stop it. rc may be nil if WithoutRedis is used.
 //
 // Panics if both WithoutLocalCache and WithoutRedis are used together: a
@@ -129,8 +131,8 @@ func NewTieredCache(rc *redis.Client, localTTL, remoteTTL time.Duration, opts ..
 		opt(tc)
 	}
 	if !tc.localEnabled && !tc.remoteEnabled {
-		//nolint:forbidigo // construction-time misconfiguration, not a runtime condition — same class as regexp.MustCompile
-		panic("cache: WithoutLocalCache and WithoutRedis together disable both tiers — TieredCache would never store or retrieve anything")
+		//nolint:forbidigo // construction-time misconfiguration, not a runtime condition, same class as regexp.MustCompile
+		panic("cache: WithoutLocalCache and WithoutRedis together disable both tiers. TieredCache would never store or retrieve anything")
 	}
 	if tc.localEnabled {
 		tc.local = newLocalCache(tc.localCacheMaxSize, tc.localCacheEvictInterval)
@@ -141,7 +143,7 @@ func NewTieredCache(rc *redis.Client, localTTL, remoteTTL time.Duration, opts ..
 // Close releases resources owned by the TieredCache: the local tier's TTL
 // sweeper (if it has one), and the pubsub subscription if
 // SubscribeInvalidations was called. It does not close the redis client,
-// since TieredCache doesn't own it — the caller constructed it and is
+// since TieredCache doesn't own it. The caller constructed it and is
 // responsible for it.
 func (tc *TieredCache) Close() error {
 	if tc.local != nil {
@@ -151,6 +153,12 @@ func (tc *TieredCache) Close() error {
 		return tc.sub.Close()
 	}
 	return nil
+}
+
+// Stats returns a snapshot of the current hit/miss/error counters. See
+// Stats's doc comment for what each field means and how to read them.
+func (tc *TieredCache) Stats() Stats {
+	return tc.stats.snapshot()
 }
 
 // Get looks up key, checking the local tier first (unless WithoutLocalCache
@@ -166,10 +174,12 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 			// safe under normal use; guard it anyway rather than risk a
 			// panic.
 			if b, ok := val.([]byte); ok {
+				tc.stats.localHits.Add(1)
 				return b, true
 			}
 			return nil, false
 		}
+		tc.stats.localMisses.Add(1)
 	}
 
 	if !tc.remoteEnabled {
@@ -180,10 +190,12 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 	val, err := tc.redis.Get(ctx, key).Bytes()
 	switch {
 	case err == nil:
+		tc.stats.redisHits.Add(1)
 		decoded := val
 		if tc.codec != nil {
 			decoded, err = tc.codec.Decode(val)
 			if err != nil {
+				tc.stats.decodeErrors.Add(1)
 				tc.observer.OnDecodeError(err)
 				// Fail open, same as a redis error: don't promote
 				// undecodable bytes into the local tier.
@@ -192,8 +204,8 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 		}
 
 		if tc.localEnabled {
-			// Local always holds the decoded value — never the encoded
-			// wire format — so a later warm Get doesn't need to decode
+			// Local always holds the decoded value, never the encoded
+			// wire format, so a later warm Get doesn't need to decode
 			// again and doesn't return raw/compressed bytes to the
 			// caller.
 			tc.local.Set(key, decoded, tc.localTTL)
@@ -201,11 +213,13 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 		return decoded, true
 	case errors.Is(err, redis.Nil):
 		// Genuine miss: the key doesn't exist in redis either.
+		tc.stats.redisMisses.Add(1)
 		return nil, false
 	default:
-		// Something other than a miss — timeout, connection error, etc.
+		// Something other than a miss, e.g. a timeout or connection error.
 		// We still report this as a miss (failing open is the right
 		// default for a cache), but let an observer know it happened.
+		tc.stats.redisErrors.Add(1)
 		tc.observer.OnRedisError(err)
 		return nil, false
 	}
@@ -227,6 +241,7 @@ func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error 
 	if tc.codec != nil {
 		encoded, err := tc.codec.Encode(value)
 		if err != nil {
+			tc.stats.encodeErrors.Add(1)
 			tc.observer.OnEncodeError(err)
 			return fmt.Errorf("encode value for key %s: %w", key, err)
 		}
@@ -259,7 +274,7 @@ func (tc *TieredCache) Invalidate(ctx context.Context, key string) error {
 }
 
 // SubscribeInvalidations starts listening for invalidations published by
-// Invalidate — on this node or others — and evicts the affected key from
+// Invalidate, on this node or others, and evicts the affected key from
 // the local tier. Call it at most once per TieredCache; call Close to stop
 // it.
 //
@@ -308,9 +323,10 @@ func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ct
 
 		// Fail open: the loader already did the real work and val is
 		// good, so a cache-population failure shouldn't fail this call
-		// too. Report it via the observer instead of the return value —
+		// too. Report it via the observer instead of the return value,
 		// see Observer.OnSetError's doc comment.
 		if err := tc.Set(ctx, key, val); err != nil {
+			tc.stats.setErrors.Add(1)
 			tc.observer.OnSetError(fmt.Errorf("set key %s: %w", key, err))
 		}
 

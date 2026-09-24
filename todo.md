@@ -2,7 +2,8 @@
 
 - [ ] Add batching support for all the commands
 - [ ] Add batch loader as well
-- [ ] Add metrics for the in-mem cache hits/misses size etc.. and the latency for it, as well as for the remote. use atomics for this.
+- [x] Add metrics for the in-mem cache hits/misses etc.. as well as for the remote. use atomics for this. (`Stats()`)
+- [ ] Add latency metrics, as histograms wired through Observer (not atomics, deferred)
 - [x] Add `WithCache` function that takes in a callback and caches the actual result of that function
 - [x] Make it more configurable with the options pattern
 - [x] Add some examples in how to use this.

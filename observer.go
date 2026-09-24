@@ -1,13 +1,13 @@
 package strata
 
 // Observer receives notifications about failures inside a TieredCache. All
-// methods must be safe to call concurrently and should return quickly —
-// they're invoked inline on the request path, not on a separate goroutine.
+// methods must be safe to call concurrently and should return quickly.
+// They're invoked inline on the request path, not on a separate goroutine.
 // Wire an Observer up to your metrics/logger; without one (the default), a
 // TieredCache uses NoopObserver and every event is silently dropped.
 //
 // Embed NoopObserver in your own type to satisfy Observer without
-// implementing every method — a method added to this interface later then
+// implementing every method. A method added to this interface later then
 // defaults to a no-op for existing implementers instead of breaking them.
 type Observer interface {
 	// OnRedisError is called when a redis call inside Get fails for a
@@ -37,7 +37,7 @@ type Observer interface {
 
 // NoopObserver implements Observer with methods that do nothing. It's the
 // default Observer for a TieredCache, and it's meant to be embedded in your
-// own observer type when you only care about some events — see Observer's
+// own observer type when you only care about some events, see Observer's
 // doc comment.
 type NoopObserver struct{}
 
@@ -55,6 +55,6 @@ func (NoopObserver) OnSetError(error) {}
 
 var _ Observer = NoopObserver{}
 
-// Compile-time proof that embedding NoopObserver alone satisfies Observer —
+// Compile-time proof that embedding NoopObserver alone satisfies Observer,
 // the whole point of providing it.
 var _ Observer = struct{ NoopObserver }{}

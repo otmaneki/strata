@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// benchUser simulates a realistic cached value for the generic layer — the
+// benchUser simulates a realistic cached value for the generic layer, the
 // struct form of what benchValue (in cache_bench_test.go) already
 // represents as raw JSON, so these benchmarks measure the actual
 // Marshal/Unmarshal cost GetOrLoad[T] adds on top of the already-benchmarked
@@ -39,7 +39,7 @@ func BenchmarkGetOrLoad_Generic(b *testing.B) {
 
 	// GetWarmLocal is the steady-state hot path: value already promoted
 	// into the local tier, so this isolates Unmarshal's cost on top of a
-	// lock-free local read — compare against BenchmarkTieredCache/GetWarmLocal
+	// lock-free local read. Compare against BenchmarkTieredCache/GetWarmLocal
 	// to see the marshaling overhead specifically.
 	b.Run("GetWarmLocal", func(b *testing.B) {
 		tc := newCache(b)
@@ -75,7 +75,7 @@ func BenchmarkGetOrLoad_Generic(b *testing.B) {
 }
 
 // BenchmarkWithCache benchmarks the WithCache decorator, which is just
-// GetOrLoad curried behind a keyFn — mainly confirms currying itself doesn't
+// GetOrLoad curried behind a keyFn, mainly confirms currying itself doesn't
 // add measurable overhead on top of BenchmarkGetOrLoad_Generic's numbers.
 func BenchmarkWithCache(b *testing.B) {
 	ctx := context.Background()

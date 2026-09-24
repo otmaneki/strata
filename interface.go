@@ -9,7 +9,7 @@ import (
 type Reader interface {
 	// Get looks up key, returning its value and whether it was found. A
 	// "not found" result must cover both a genuine miss and any backend
-	// failure — callers can't tell the two apart from the return value
+	// failure. Callers can't tell the two apart from the return value
 	// alone.
 	Get(ctx context.Context, key string) ([]byte, bool)
 }
@@ -20,7 +20,7 @@ type Writer interface {
 	Set(ctx context.Context, key string, value []byte) error
 }
 
-// ReadWriter is Reader and Writer combined — the shape most request-path
+// ReadWriter is Reader and Writer combined, the shape most request-path
 // code actually needs: look values up, store them, nothing else.
 type ReadWriter interface {
 	Reader
@@ -53,7 +53,7 @@ type Invalidator interface {
 // Loader, and Invalidator, plus io.Closer for releasing owned resources.
 //
 // Depend on the smallest of these your code actually calls, not
-// necessarily the whole Cache — a request handler that only reads and
+// necessarily the whole Cache. A request handler that only reads and
 // writes needs ReadWriter, not Invalidate/SubscribeInvalidations/Close, and
 // its test mocks shrink to match. Reach for Cache itself where code really
 // does span the full lifecycle (e.g. wherever constructs a TieredCache and
@@ -62,7 +62,7 @@ type Invalidator interface {
 //
 // TieredCache is the only production implementation; see its doc comments
 // for the full behavior contract (e.g. how Get treats a redis error versus
-// a genuine miss) — a test double should honor the same contract for the
+// a genuine miss). A test double should honor the same contract for the
 // methods it exercises.
 type Cache interface {
 	Reader

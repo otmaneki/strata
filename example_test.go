@@ -44,6 +44,43 @@ func ExampleTieredCache_Set() {
 	// hello true
 }
 
+// ExampleTieredCache_Stats shows reading the hit/miss counters. They're
+// cumulative for the life of the TieredCache, scrape them periodically
+// rather than resetting them, so this example reads them after a known,
+// fixed sequence of calls instead of mid-traffic.
+func ExampleTieredCache_Stats() {
+	client, err := newExampleRedisClient()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer client.Close() //nolint:errcheck // example cleanup
+
+	tc := NewTieredCache(client, time.Minute, time.Minute)
+	defer tc.Close() //nolint:errcheck // example cleanup
+
+	ctx := context.Background()
+
+	tc.Get(ctx, "missing") // local miss, then a genuine redis miss
+
+	if err := tc.Set(ctx, "greeting", []byte("hello")); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	tc.Get(ctx, "greeting") // local hit: Set already populated the local tier
+
+	stats := tc.Stats()
+	fmt.Println("local hits:", stats.LocalHits)
+	fmt.Println("local misses:", stats.LocalMisses)
+	fmt.Println("redis misses:", stats.RedisMisses)
+
+	// Output:
+	// local hits: 1
+	// local misses: 1
+	// redis misses: 1
+}
+
 // ExampleTieredCache_GetOrLoad shows the cache-aside pattern: on a miss, the
 // loader is invoked once to populate the cache; a second call for the same
 // key is served without calling the loader again.
@@ -87,7 +124,7 @@ func ExampleTieredCache_GetOrLoad() {
 }
 
 // productFilters is a stand-in for the kind of struct a search/listing
-// endpoint builds from request query params — several fields that together
+// endpoint builds from request query params, several fields that together
 // determine what to query for.
 type productFilters struct {
 	Category string
@@ -97,7 +134,7 @@ type productFilters struct {
 
 // cacheKey turns filters into a deterministic string key: same filters,
 // same key, every time. That's the only requirement GetOrLoad has for a
-// key — it's written out explicitly here (rather than, say, JSON-marshaling
+// key. It's written out explicitly here (rather than, say, JSON-marshaling
 // the whole struct) so the key format doesn't silently change if a field
 // gets renamed or reordered later.
 func (f productFilters) cacheKey() string {
@@ -119,8 +156,8 @@ func buildProductQuery(f productFilters) (query string, args []any) {
 
 // ExampleTieredCache_GetOrLoad_filters shows GetOrLoad's loader doing real
 // work instead of a trivial lookup: it's an ordinary closure, so it can
-// capture whatever it needs from the enclosing scope — here, a filters
-// struct and (in a real program) a *sql.DB — build a query from it, and
+// capture whatever it needs from the enclosing scope, here, a filters
+// struct and (in a real program) a *sql.DB, build a query from it, and
 // execute it. GetOrLoad doesn't know or care what's inside the loader; all
 // it needs is a key that's deterministic for the same filters, which is
 // exactly what filters.cacheKey() gives it. A second call with the same
@@ -128,7 +165,7 @@ func buildProductQuery(f productFilters) (query string, args []any) {
 // again.
 //
 // If you want a reusable, typed function instead of calling GetOrLoad
-// inline at every call site — e.g. "listProducts(ctx, filters)" — wrap this
+// inline at every call site, e.g. "listProducts(ctx, filters)", wrap this
 // same loader with WithCache instead: it takes the filters struct as its
 // Args type directly, so keyFn and the query-building logic look the same,
 // just moved into WithCache's wiring instead of a call site.
@@ -312,7 +349,7 @@ func ExampleWithLocalCacheSize() {
 
 // ExampleWithoutRedis shows using only the in-process local tier, with no
 // redis involved at all. The redis client argument to NewTieredCache can be
-// nil in this mode — it's never dialed — which makes this the cheapest way
+// nil in this mode, it's never dialed, which makes this the cheapest way
 // to get TieredCache's API (including GetOrLoad's singleflight dedup)
 // without a redis dependency, at the cost of no cross-instance consistency.
 func ExampleWithoutRedis() {
@@ -334,7 +371,7 @@ func ExampleWithoutRedis() {
 
 // ExampleWithoutLocalCache shows using only the redis tier, with no
 // in-process local cache. Every Get and Set goes straight to redis, and
-// nothing is ever held in per-instance memory — the trade to reach for when
+// nothing is ever held in per-instance memory, the trade to reach for when
 // even localTTL of staleness, or per-instance memory use, is unacceptable.
 func ExampleWithoutLocalCache() {
 	client, err := newExampleRedisClient()
@@ -361,7 +398,7 @@ func ExampleWithoutLocalCache() {
 }
 
 // exampleObserver embeds NoopObserver so it only has to implement the one
-// event it cares about — the pattern Observer's doc comment recommends for
+// event it cares about, the pattern Observer's doc comment recommends for
 // your own Observer implementations.
 type exampleObserver struct {
 	NoopObserver

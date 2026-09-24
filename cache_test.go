@@ -91,7 +91,7 @@ func TestLocalCache_ConcurrentExpiryDoesNotCorruptSize(t *testing.T) {
 // other goroutines) before incrementing size. That left a window where a
 // concurrent Delete on the same, just-inserted key could observe the entry
 // and decrement size before Set's own increment ran, which is enough for
-// Len() to be observed negative — wrong in a way "briefly stale" doesn't
+// Len() to be observed negative, wrong in a way "briefly stale" doesn't
 // excuse, since a cache can't hold a negative number of entries. Set now
 // increments speculatively before Swap and undoes it if the key turned out
 // to already exist (an update, not an insert).
@@ -140,8 +140,8 @@ func TestLocalCache_ConcurrentSetDeleteDoesNotCorruptSize(t *testing.T) {
 
 // observerFunc adapts individual functions to the Observer interface for
 // tests that only care about one event. Embedding NoopObserver means an
-// unset field falls through to the no-op default, and — same as in
-// production code — Observer growing a new method later wouldn't break this
+// unset field falls through to the no-op default, and, same as in
+// production code, Observer growing a new method later wouldn't break this
 // type either.
 type observerFunc struct {
 	NoopObserver
@@ -228,7 +228,7 @@ func TestTieredCache_Get_RedisFailureTriggersErrorHandler(t *testing.T) {
 }
 
 // Regression guard: GetOrLoad must fail open when caching the loaded value
-// fails — the loader already did the real work, so a redis outage on the
+// fails, the loader already did the real work, so a redis outage on the
 // write path shouldn't fail the caller's request on top of it. An earlier
 // version of this code returned the Set error from GetOrLoad directly,
 // which meant a redis write outage failed every GetOrLoad call in the
@@ -311,7 +311,7 @@ func TestTieredCache_WithoutLocalCache_BypassesLocalTier(t *testing.T) {
 	}
 }
 
-// TestTieredCache_WithoutRedis_NeverTouchesRedis passes a nil redis client —
+// TestTieredCache_WithoutRedis_NeverTouchesRedis passes a nil redis client,
 // the strongest possible proof that redis is never dialed in this mode: any
 // code path that touched tc.redis would nil-pointer-panic immediately.
 func TestTieredCache_WithoutRedis_NeverTouchesRedis(t *testing.T) {
@@ -454,6 +454,135 @@ type codecFunc struct {
 
 func (c codecFunc) Encode(value []byte) ([]byte, error) { return c.encode(value) }
 func (c codecFunc) Decode(data []byte) ([]byte, error)  { return c.decode(data) }
+
+// TestTieredCache_Stats exercises every Stats counter through the code path
+// that's supposed to increment it, one at a time, and checks nothing else
+// there.
+func TestTieredCache_Stats(t *testing.T) {
+	t.Run("local and redis hits and misses", func(t *testing.T) {
+		tc, _ := newMiniredisTieredCache(t)
+		ctx := context.Background()
+		const key = "key"
+
+		// Redis miss: nothing has been written for this key anywhere yet.
+		if _, ok := tc.Get(ctx, key); ok {
+			t.Fatal("expected a miss")
+		}
+
+		if err := tc.Set(ctx, key, []byte("value")); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+
+		// Local hit: Set already populated the local tier.
+		if _, ok := tc.Get(ctx, key); !ok {
+			t.Fatal("expected a hit")
+		}
+
+		// Redis hit: force the local tier to miss so this Get falls
+		// through to redis.
+		tc.local.Delete(key)
+		if _, ok := tc.Get(ctx, key); !ok {
+			t.Fatal("expected a hit")
+		}
+
+		stats := tc.Stats()
+		if stats.LocalHits != 1 {
+			t.Errorf("LocalHits = %d, want 1", stats.LocalHits)
+		}
+		if stats.LocalMisses != 2 { // the very first Get, and the forced-cold one
+			t.Errorf("LocalMisses = %d, want 2", stats.LocalMisses)
+		}
+		if stats.RedisHits != 1 {
+			t.Errorf("RedisHits = %d, want 1", stats.RedisHits)
+		}
+		if stats.RedisMisses != 1 {
+			t.Errorf("RedisMisses = %d, want 1", stats.RedisMisses)
+		}
+	})
+
+	t.Run("redis error", func(t *testing.T) {
+		// Nothing listens on this port, so every redis call fails outright;
+		// a short deadline keeps the test fast regardless of environment.
+		client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+		defer client.Close() //nolint:errcheck // test cleanup
+		tc := NewTieredCache(client, time.Minute, time.Minute)
+		defer tc.Close() //nolint:errcheck // test cleanup
+
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		if _, ok := tc.Get(ctx, "key"); ok {
+			t.Fatal("expected a miss")
+		}
+
+		if got := tc.Stats().RedisErrors; got != 1 {
+			t.Errorf("RedisErrors = %d, want 1", got)
+		}
+	})
+
+	t.Run("encode error", func(t *testing.T) {
+		boom := errors.New("boom")
+		failingCodec := codecFunc{
+			encode: func([]byte) ([]byte, error) { return nil, boom },
+			decode: func(data []byte) ([]byte, error) { return data, nil },
+		}
+		tc, _ := newMiniredisTieredCache(t, WithCodec(failingCodec))
+		ctx := context.Background()
+
+		if err := tc.Set(ctx, "key", []byte("hello")); err == nil {
+			t.Fatal("expected Set to return the encode error")
+		}
+
+		if got := tc.Stats().EncodeErrors; got != 1 {
+			t.Errorf("EncodeErrors = %d, want 1", got)
+		}
+	})
+
+	t.Run("decode error", func(t *testing.T) {
+		// Start plain (no codec) so redis can be seeded directly with data
+		// that won't decode, simulating e.g. entries written before a
+		// codec was introduced.
+		_, client := newMiniredisTieredCache(t)
+		ctx := context.Background()
+		const key = "key"
+
+		if err := client.Set(ctx, key, []byte("not-encoded"), time.Minute).Err(); err != nil {
+			t.Fatalf("seeding redis: %v", err)
+		}
+
+		tc := NewTieredCache(client, time.Minute, time.Minute, WithCodec(prefixCodec{marker: 0xAB}))
+		defer tc.Close() //nolint:errcheck // test cleanup
+
+		if _, ok := tc.Get(ctx, key); ok {
+			t.Fatal("expected a miss")
+		}
+
+		if got := tc.Stats().DecodeErrors; got != 1 {
+			t.Errorf("DecodeErrors = %d, want 1", got)
+		}
+	})
+
+	t.Run("set error inside GetOrLoad", func(t *testing.T) {
+		// Nothing listens on this port, so every redis call fails outright;
+		// a short deadline keeps the test fast regardless of environment.
+		client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+		defer client.Close() //nolint:errcheck // test cleanup
+		tc := NewTieredCache(client, time.Minute, time.Minute)
+		defer tc.Close() //nolint:errcheck // test cleanup
+
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		loader := func(context.Context) ([]byte, error) { return []byte("value"), nil }
+		if _, err := tc.GetOrLoad(ctx, "key", loader); err != nil {
+			t.Fatalf("GetOrLoad returned an error despite a successful loader call: %v", err)
+		}
+
+		if got := tc.Stats().SetErrors; got != 1 {
+			t.Errorf("SetErrors = %d, want 1", got)
+		}
+	})
+}
 
 // TestWithCache_MemoizesFunction verifies WithCache's whole reason to
 // exist: a second call with the same args must be served from the cache

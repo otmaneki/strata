@@ -17,7 +17,7 @@ type entry struct {
 // access order, so eviction picks an arbitrary victim rather than the
 // least-recently-used one, and the grow-then-evict sequence in Set isn't
 // atomic under concurrent writers. For a cache (not an authoritative store)
-// that trade-off is the right one — it keeps reads free of locking.
+// that trade-off is the right one, it keeps reads free of locking.
 type localCache struct {
 	data sync.Map
 	// maxSize <= 0 means unbounded: no eviction on write
@@ -75,8 +75,8 @@ func (c *localCache) Set(key string, value any, ttl time.Duration) {
 	e := &entry{value: value, expiresAt: time.Now().Add(ttl)}
 
 	// size is incremented speculatively, before Swap makes the entry
-	// visible to other goroutines. Doing it the other way around — Swap,
-	// then increment — leaves a window where a concurrent Delete can
+	// visible to other goroutines. Doing it the other way around, Swap,
+	// then increment, leaves a window where a concurrent Delete can
 	// observe the freshly-stored entry and decrement size before this call
 	// gets to its own increment, which is enough for Len() to be observed
 	// transiently negative. If this Set turns out to be an update rather
@@ -124,7 +124,7 @@ func (c *localCache) evictLoop(interval time.Duration) {
 
 // evictOne removes one entry other than except (the key that was just
 // inserted) to bring the cache back under its size bound. The victim is
-// whatever sync.Map's Range happens to visit first — there's no
+// whatever sync.Map's Range happens to visit first. There's no
 // access-order tracking to do better than that without giving up the
 // lock-free read path.
 func (c *localCache) evictOne(except string) {
@@ -132,7 +132,7 @@ func (c *localCache) evictOne(except string) {
 		if key == except {
 			return true // keep scanning
 		}
-		// LoadAndDelete: see the comment in Get — another goroutine (a
+		// LoadAndDelete, see the comment in Get. Another goroutine (a
 		// concurrent evictOne, or an expiry in Get/sweepExpired) may have
 		// already removed this exact key between Range visiting it and us
 		// calling Delete.
@@ -151,7 +151,7 @@ func (c *localCache) sweepExpired() {
 			return true // skip this one, keep scanning the rest
 		}
 		if now.After(e.expiresAt) {
-			// LoadAndDelete: see the comment in Get — a concurrent Get on
+			// LoadAndDelete, see the comment in Get. A concurrent Get on
 			// this same key may be expiring and removing it at the same
 			// time.
 			if _, loaded := c.data.LoadAndDelete(key); loaded {

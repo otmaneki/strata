@@ -4,7 +4,7 @@ A two-tier cache for Go: an in-process local cache sits in front of redis,
 with pub/sub-driven invalidation so a write on one node evicts the stale
 copy cached on others.
 
-The name comes from geology — strata are the layers of rock that build up
+The name comes from geology. Strata are the layers of rock that build up
 over time, each one sitting on top of the one below it. A `Get` here works
 the same way: it checks the local layer first, and falls through to the
 redis layer beneath it only if the value isn't there yet.
@@ -32,7 +32,7 @@ promotion/invalidation logic yourself.
   publishes the eviction over redis pub/sub; `SubscribeInvalidations` picks
   those up on every other instance.
 - **`GetOrLoad` with singleflight.** Concurrent misses for the same key
-  collapse into a single loader call — everyone else waits and shares the
+  collapse into a single loader call. Everyone else waits and shares the
   result, instead of a thundering herd hitting your database.
 - **Generic, typed helpers.** `GetOrLoad[T]` and `WithCache` marshal/
   unmarshal a `T` for you (JSON by default, pluggable via `Marshaler`), so
@@ -42,14 +42,19 @@ promotion/invalidation logic yourself.
   dependency at all); `WithoutLocalCache()` runs redis-only (no per-instance
   memory, no staleness window).
 - **Pluggable wire-format codec.** `Codec` transforms values before they hit
-  redis and after they come back — e.g. compression — without touching the
+  redis and after they come back, e.g. compression, without touching the
   local tier, which always holds the plain decoded value.
 - **Observability, not silence.** An `Observer` is notified on redis
   failures, codec failures, and background `Set` failures inside
-  `GetOrLoad` — all of which fail open (never surfaced as an error to the
+  `GetOrLoad`, all of which fail open (never surfaced as an error to the
   caller) but are worth knowing about.
+- **Built-in hit/miss/error counters.** `Stats()` returns a cumulative
+  snapshot of local and redis hits/misses, plus redis, encode, decode, and
+  set errors, tracked with plain atomics on the request path, cheap enough
+  to leave on always. Latency isn't tracked internally, that's a job for a
+  real histogram via `Observer`, not something to reimplement here.
 - **Small, composable interfaces.** `Cache` is built from `Reader`,
-  `Writer`, `Loader`, and `Invalidator` — depend on the smallest one your
+  `Writer`, `Loader`, and `Invalidator`. Depend on the smallest one your
   code actually needs, and mock accordingly.
 
 ## Install
@@ -141,6 +146,16 @@ tc := strata.NewTieredCache(redisClient, time.Minute, time.Hour,
 )
 ```
 
+### Reading hit/miss/error counters
+
+```go
+stats := tc.Stats()
+log.Printf("local hit rate: %d/%d", stats.LocalHits, stats.LocalHits+stats.LocalMisses)
+```
+
+`Stats()` is a cheap, cumulative snapshot. Call it on whatever interval
+your metrics system scrapes on, no need to cache the result yourself.
+
 More runnable examples for every option live in `example_test.go`.
 
 ## How it works
@@ -148,11 +163,11 @@ More runnable examples for every option live in `example_test.go`.
 - **`Get`** checks the local tier first. On a miss, it reads redis; a hit is
   decoded (if a `Codec` is set) and promoted into the local tier so the
   next `Get` for that key is served locally. A redis error that isn't a
-  genuine miss is reported to the `Observer`, not the caller — `Get` fails
+  genuine miss is reported to the `Observer`, not the caller. `Get` fails
   open and looks like a miss either way, since that's the safer default for
   a cache.
 - **`Set`** writes to the local tier immediately and to redis. If a `Codec`
-  is configured, only the redis copy is transformed — the local tier always
+  is configured, only the redis copy is transformed, the local tier always
   holds the original value, so a warm local read never pays an encode/
   decode cost.
 - **`Invalidate`** deletes locally, deletes in redis, then publishes the key
@@ -161,18 +176,18 @@ More runnable examples for every option live in `example_test.go`.
 - **`GetOrLoad`** wraps `Get`, a `singleflight.Group`, and `Set`: on a miss,
   only one goroutine per key runs the loader; everyone else waits for it
   and shares the result. If caching the loaded value afterward fails, the
-  loaded value is still returned — the loader already did the real work,
+  loaded value is still returned, the loader already did the real work,
   so a redis write failure shouldn't fail the caller's request on top of
   it.
 - **The local tier** is a `sync.Map` with an approximate size bound and a
-  background TTL sweep — lock-free reads, best-effort eviction (no LRU
+  background TTL sweep, lock-free reads and best-effort eviction (no LRU
   ordering, since `sync.Map` doesn't track access order), documented as
   such rather than pretending to be exact.
 
 ## Benchmarks
 
 Run with `make bench` (`go test -bench . -benchmem`, default `-benchtime`),
-against an in-process miniredis instance — no real network hop, so these
+against an in-process miniredis instance, no real network hop, so these
 are a lower bound on how much redis actually costs relative to the local
 tier; a real network round trip only widens the gap. Point `REDIS_ADDR` at
 a real redis instance for numbers that include one (`make bench
@@ -208,24 +223,24 @@ BenchmarkWithCache-16                             1000000     1650 ns/op   152 B
 
 **What these say:**
 
-- **A warm local read is ~61ns, whether it's `LocalOnly` or `TieredCache`** —
-  tiering costs nothing once a key is promoted. Compare that to `~66µs` for
+- **A warm local read is ~61ns, whether it's `LocalOnly` or `TieredCache`.**
+  Tiering costs nothing once a key is promoted. Compare that to `~66µs` for
   a plain redis `Get`: roughly **1,000x** faster, even against miniredis
   with no real network involved.
-- **`GetColdLocal` (79µs) tracks the raw redis `Get` (66µs) closely** — the
+- **`GetColdLocal` (79µs) tracks the raw redis `Get` (66µs) closely.** The
   local-miss check is cheap, so falling back to redis costs exactly one
   round trip, no hidden tiering tax.
-- **Parallel redis reads drop to ~3.6µs** — connection-pool overlap
+- **Parallel redis reads drop to ~3.6µs.** Connection-pool overlap
   amortizing round-trip latency across goroutines, not redis getting
   faster per call. `LocalOnly`/`TieredCache` warm reads scale the same way
   down to ~7ns, `sync.Map`'s lock-free read path doing what it's for.
 - **`GetOrLoadContended` proves the singleflight dedup**: 32 goroutines
   racing a cold key produce exactly **1.000 loader calls per round**,
-  versus **31.93** without it (`GetOrLoadContendedNoDedup`) — that's the
+  versus **31.93** without it (`GetOrLoadContendedNoDedup`). That's the
   thundering-herd protection actually measured, not just asserted, and it
   roughly halves allocations per round too (32KB vs 70KB).
 - **The generic helpers cost what JSON marshaling costs**, not what the
-  cache costs — `GetOrLoad[T]`'s warm path is ~1.3µs and `WithCache`'s is
+  cache costs. `GetOrLoad[T]`'s warm path is ~1.3µs and `WithCache`'s is
   ~1.65µs, both dominated by `encoding/json`, not the ~60ns cache lookup
   underneath them.
 

@@ -154,8 +154,8 @@ func TestWithCache_MemoizesPerArgument(t *testing.T) {
 	}
 }
 
-// The generic layer never touches tier logic directly — it only calls
-// Cache.GetOrLoad — so these two are less "does the generic layer support
+// The generic layer never touches tier logic directly. It only calls
+// Cache.GetOrLoad, so these two are less "does the generic layer support
 // tier bypass" and more "is that delegation actually as complete as it
 // looks," the same distinction the byte-level WithoutLocalCache/WithoutRedis
 // tests exist to prove rather than assume.
@@ -187,7 +187,7 @@ func TestGetOrLoad_Generic_ComposesWithWithoutLocalCache(t *testing.T) {
 }
 
 func TestGetOrLoad_Generic_ComposesWithWithoutRedis(t *testing.T) {
-	// nil redis client: the strongest proof redis is never touched — see
+	// nil redis client: the strongest proof redis is never touched. See
 	// TestTieredCache_WithoutRedis_NeverTouchesRedis for the same reasoning
 	// at the byte level.
 	tc := NewTieredCache(nil, time.Minute, time.Minute, WithoutRedis())

@@ -5,7 +5,7 @@ import "encoding/json"
 // Marshaler converts a T to and from the []byte a Cache actually stores.
 // It's the boundary the generic GetOrLoad and WithCache use so callers
 // never hand-roll json.Marshal/Unmarshal (or any other format) around a
-// cache call themselves — see JSONMarshaler for the common case.
+// cache call themselves, see JSONMarshaler for the common case.
 //
 // This is a different concern from Codec: Codec transforms already-encoded
 // bytes for the wire (e.g. compression) and only ever applies to the redis
@@ -16,7 +16,7 @@ type Marshaler[T any] interface {
 	Unmarshal(data []byte, v *T) error
 }
 
-// JSONMarshaler is a Marshaler backed by encoding/json — the default most
+// JSONMarshaler is a Marshaler backed by encoding/json, the default most
 // callers want:
 //
 //	strata.GetOrLoad(ctx, tc, strata.JSONMarshaler[User]{}, key, loader)
