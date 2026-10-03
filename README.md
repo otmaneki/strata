@@ -51,8 +51,13 @@ promotion/invalidation logic yourself.
 - **Built-in hit/miss/error counters.** `Stats()` returns a cumulative
   snapshot of local and redis hits/misses, plus redis, encode, decode, and
   set errors, tracked with plain atomics on the request path, cheap enough
-  to leave on always. Latency isn't tracked internally, that's a job for a
-  real histogram via `Observer`, not something to reimplement here.
+  to leave on always.
+- **Pluggable latency histograms.** `WithLocalLatencyHistogram` and
+  `WithRedisLatencyHistogram` take any type with an `Observe(seconds
+  float64)` method, a prometheus histogram works as-is, and record how long
+  each local tier lookup and each redis round trip takes. Separate
+  histograms because the two have very different scales: local is a
+  lock-free map read, redis is a network call.
 - **Small, composable interfaces.** `Cache` is built from `Reader`,
   `Writer`, `Loader`, and `Invalidator`. Depend on the smallest one your
   code actually needs, and mock accordingly.
@@ -155,6 +160,18 @@ log.Printf("local hit rate: %d/%d", stats.LocalHits, stats.LocalHits+stats.Local
 
 `Stats()` is a cheap, cumulative snapshot. Call it on whatever interval
 your metrics system scrapes on, no need to cache the result yourself.
+
+### Latency histograms
+
+```go
+tc := strata.NewTieredCache(redisClient, time.Minute, time.Hour,
+    strata.WithLocalLatencyHistogram(myLocalHistogram),
+    strata.WithRedisLatencyHistogram(myRedisHistogram),
+)
+```
+
+Bucket boundaries are up to you, and the two histograms will usually want
+different ones given the scale difference above.
 
 More runnable examples for every option live in `example_test.go`.
 

@@ -81,6 +81,41 @@ func ExampleTieredCache_Stats() {
 	// redis misses: 1
 }
 
+// ExampleWithRedisLatencyHistogram shows wiring up latency histograms for
+// both tiers. fakeHistogram just counts observations for this example,
+// in real use pass in a prometheus, OpenTelemetry, or other metrics
+// library's histogram instead, anything with a matching Observe method.
+func ExampleWithRedisLatencyHistogram() {
+	client, err := newExampleRedisClient()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer client.Close() //nolint:errcheck // example cleanup
+
+	localLatency := &fakeHistogram{}
+	redisLatency := &fakeHistogram{}
+	tc := NewTieredCache(client, time.Minute, time.Minute,
+		WithLocalLatencyHistogram(localLatency),
+		WithRedisLatencyHistogram(redisLatency),
+	)
+	defer tc.Close() //nolint:errcheck // example cleanup
+
+	ctx := context.Background()
+	if err := tc.Set(ctx, "greeting", []byte("hello")); err != nil {
+		fmt.Println(err)
+		return
+	}
+	tc.Get(ctx, "greeting") // local hit: no redis round trip, no new redis observation
+
+	fmt.Println("local observations:", localLatency.Count())
+	fmt.Println("redis observations:", redisLatency.Count())
+
+	// Output:
+	// local observations: 2
+	// redis observations: 1
+}
+
 // ExampleTieredCache_GetOrLoad shows the cache-aside pattern: on a miss, the
 // loader is invoked once to populate the cache; a second call for the same
 // key is served without calling the loader again.

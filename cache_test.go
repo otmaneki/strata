@@ -584,6 +584,87 @@ func TestTieredCache_Stats(t *testing.T) {
 	})
 }
 
+// fakeHistogram is a Histogram that just counts how many observations it
+// received, which is all these tests need, not the values themselves.
+// Observe is called inline on the request path from concurrent callers in
+// some tests, so it guards the counter with a mutex.
+type fakeHistogram struct {
+	mu    sync.Mutex
+	count int
+}
+
+func (h *fakeHistogram) Observe(float64) {
+	h.mu.Lock()
+	h.count++
+	h.mu.Unlock()
+}
+
+func (h *fakeHistogram) Count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.count
+}
+
+func TestTieredCache_LatencyHistograms(t *testing.T) {
+	t.Run("records local and redis latency on Get and Set", func(t *testing.T) {
+		local := &fakeHistogram{}
+		redisHist := &fakeHistogram{}
+		tc, _ := newMiniredisTieredCache(t, WithLocalLatencyHistogram(local), WithRedisLatencyHistogram(redisHist))
+		ctx := context.Background()
+		const key = "key"
+
+		// Set: one local observation, one redis observation.
+		if err := tc.Set(ctx, key, []byte("value")); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		if got := local.Count(); got != 1 {
+			t.Errorf("after Set, local histogram count = %d, want 1", got)
+		}
+		if got := redisHist.Count(); got != 1 {
+			t.Errorf("after Set, redis histogram count = %d, want 1", got)
+		}
+
+		// Local hit: one more local observation, no redis call at all.
+		if _, ok := tc.Get(ctx, key); !ok {
+			t.Fatal("expected a hit")
+		}
+		if got := local.Count(); got != 2 {
+			t.Errorf("after local-hit Get, local histogram count = %d, want 2", got)
+		}
+		if got := redisHist.Count(); got != 1 {
+			t.Errorf("after local-hit Get, redis histogram count = %d, want 1", got)
+		}
+
+		// Force a redis round trip: one more local observation (the miss
+		// check), one more redis observation, and one more local
+		// observation (the redis-hit promotion back into the local tier).
+		tc.local.Delete(key)
+		if _, ok := tc.Get(ctx, key); !ok {
+			t.Fatal("expected a hit")
+		}
+		if got := local.Count(); got != 4 {
+			t.Errorf("after redis-hit Get, local histogram count = %d, want 4", got)
+		}
+		if got := redisHist.Count(); got != 2 {
+			t.Errorf("after redis-hit Get, redis histogram count = %d, want 2", got)
+		}
+	})
+
+	t.Run("nil histograms are left unset by default", func(t *testing.T) {
+		// No WithLocalLatencyHistogram / WithRedisLatencyHistogram: Get and
+		// Set must not panic on a nil Histogram.
+		tc, _ := newMiniredisTieredCache(t)
+		ctx := context.Background()
+
+		if err := tc.Set(ctx, "key", []byte("value")); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		if _, ok := tc.Get(ctx, "key"); !ok {
+			t.Fatal("expected a hit")
+		}
+	})
+}
+
 // TestWithCache_MemoizesFunction verifies WithCache's whole reason to
 // exist: a second call with the same args must be served from the cache
 // instead of calling the wrapped function again. It also checks that

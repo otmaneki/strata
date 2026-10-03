@@ -50,6 +50,13 @@ type TieredCache struct {
 	codec                   Codec
 
 	stats tieredStats
+
+	// redisLatency and localLatency, if set, receive a latency observation
+	// in seconds for every redis round trip and every local tier lookup,
+	// respectively. Both are nil by default, meaning nothing is recorded.
+	// Set via WithRedisLatencyHistogram and WithLocalLatencyHistogram.
+	redisLatency Histogram
+	localLatency Histogram
 }
 
 // Option configures optional TieredCache behavior.
@@ -107,6 +114,25 @@ func WithCodec(c Codec) Option {
 	return func(tc *TieredCache) { tc.codec = c }
 }
 
+// WithRedisLatencyHistogram registers a Histogram that records how long
+// each redis round trip takes, in seconds: every Get, Set, Del, and
+// Publish call. Without this option, redis latency isn't recorded
+// anywhere. No effect if WithoutRedis is also used.
+func WithRedisLatencyHistogram(h Histogram) Option {
+	return func(tc *TieredCache) { tc.redisLatency = h }
+}
+
+// WithLocalLatencyHistogram registers a Histogram that records how long
+// each local tier lookup takes, in seconds: every Get, Set, and Delete
+// call. A local lookup is a lock-free map read, so individual values are
+// tiny, this is mainly useful for spotting contention under heavy
+// concurrent load rather than catching a slow individual call. Without
+// this option, local latency isn't recorded anywhere. No effect if
+// WithoutLocalCache is also used.
+func WithLocalLatencyHistogram(h Histogram) Option {
+	return func(tc *TieredCache) { tc.localLatency = h }
+}
+
 // NewTieredCache builds a TieredCache backed by rc: values promoted from
 // redis into the local tier are kept for localTTL, values written to redis
 // are kept for remoteTTL. It starts the local tier's background TTL
@@ -161,6 +187,45 @@ func (tc *TieredCache) Stats() Stats {
 	return tc.stats.snapshot()
 }
 
+// startLocalTimer returns the current time if a local latency Histogram is
+// registered, or the zero time otherwise. Pair it with observeLocalLatency.
+// Skipping the clock read entirely when no Histogram is registered keeps
+// WithLocalLatencyHistogram's cost at zero on the hot local-read path for
+// callers who never opt into it.
+func (tc *TieredCache) startLocalTimer() time.Time {
+	if tc.localLatency == nil {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+// observeLocalLatency reports how long a local tier call took, given a
+// start time from startLocalTimer. A no-op if no local latency Histogram is
+// registered.
+func (tc *TieredCache) observeLocalLatency(start time.Time) {
+	if tc.localLatency != nil {
+		tc.localLatency.Observe(time.Since(start).Seconds())
+	}
+}
+
+// startRedisTimer is startLocalTimer's redis-tier counterpart, see its doc
+// comment.
+func (tc *TieredCache) startRedisTimer() time.Time {
+	if tc.redisLatency == nil {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+// observeRedisLatency reports how long a redis call took, given a start
+// time from startRedisTimer. A no-op if no redis latency Histogram is
+// registered.
+func (tc *TieredCache) observeRedisLatency(start time.Time) {
+	if tc.redisLatency != nil {
+		tc.redisLatency.Observe(time.Since(start).Seconds())
+	}
+}
+
 // Get looks up key, checking the local tier first (unless WithoutLocalCache
 // was used) and falling back to redis (unless WithoutRedis was used). A
 // redis hit is promoted into the local tier so the next Get for the same
@@ -168,7 +233,10 @@ func (tc *TieredCache) Stats() Stats {
 func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 	// Tier 1: Local memory
 	if tc.localEnabled {
-		if val, ok := tc.local.Get(key); ok {
+		localStart := tc.startLocalTimer()
+		val, ok := tc.local.Get(key)
+		tc.observeLocalLatency(localStart)
+		if ok {
 			// TieredCache only ever stores []byte in the local tier (via
 			// Set and the redis-hit promotion below), so this assertion is
 			// safe under normal use; guard it anyway rather than risk a
@@ -187,7 +255,9 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 	}
 
 	// Tier 2: Redis
+	redisStart := tc.startRedisTimer()
 	val, err := tc.redis.Get(ctx, key).Bytes()
+	tc.observeRedisLatency(redisStart)
 	switch {
 	case err == nil:
 		tc.stats.redisHits.Add(1)
@@ -208,7 +278,9 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 			// wire format, so a later warm Get doesn't need to decode
 			// again and doesn't return raw/compressed bytes to the
 			// caller.
+			localStart := tc.startLocalTimer()
 			tc.local.Set(key, decoded, tc.localTTL)
+			tc.observeLocalLatency(localStart)
 		}
 		return decoded, true
 	case errors.Is(err, redis.Nil):
@@ -230,7 +302,9 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 // stores the encoded form instead.
 func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error {
 	if tc.localEnabled {
+		localStart := tc.startLocalTimer()
 		tc.local.Set(key, value, tc.localTTL)
+		tc.observeLocalLatency(localStart)
 	}
 
 	if !tc.remoteEnabled {
@@ -248,7 +322,10 @@ func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error 
 		toStore = encoded
 	}
 
-	return tc.redis.Set(ctx, key, toStore, tc.remoteTTL).Err()
+	redisStart := tc.startRedisTimer()
+	err := tc.redis.Set(ctx, key, toStore, tc.remoteTTL).Err()
+	tc.observeRedisLatency(redisStart)
+	return err
 }
 
 // Invalidate removes key from whichever tiers are enabled on this node and,
@@ -259,18 +336,26 @@ func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error 
 // misleading.
 func (tc *TieredCache) Invalidate(ctx context.Context, key string) error {
 	if tc.localEnabled {
+		localStart := tc.startLocalTimer()
 		tc.local.Delete(key)
+		tc.observeLocalLatency(localStart)
 	}
 
 	if !tc.remoteEnabled {
 		return nil
 	}
 
-	if err := tc.redis.Del(ctx, key).Err(); err != nil {
+	delStart := tc.startRedisTimer()
+	err := tc.redis.Del(ctx, key).Err()
+	tc.observeRedisLatency(delStart)
+	if err != nil {
 		return fmt.Errorf("delete %s from redis: %w", key, err)
 	}
 
-	return tc.redis.Publish(ctx, invalidationPubSubChannel, key).Err()
+	pubStart := tc.startRedisTimer()
+	err = tc.redis.Publish(ctx, invalidationPubSubChannel, key).Err()
+	tc.observeRedisLatency(pubStart)
+	return err
 }
 
 // SubscribeInvalidations starts listening for invalidations published by
