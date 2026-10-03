@@ -285,6 +285,231 @@ func TestTieredCache_Invalidate_EvictsBothTiers(t *testing.T) {
 	}
 }
 
+// TestTieredCache_Set_PublishesInvalidation proves Set broadcasts the same
+// invalidation Invalidate does: a second instance, backed by the same
+// redis and subscribed via SubscribeInvalidations, must drop its stale
+// local copy when the first instance overwrites the key with Set, not just
+// with Invalidate.
+func TestTieredCache_Set_PublishesInvalidation(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("could not start miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const key = "key"
+
+	writer := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer writer.Close() //nolint:errcheck // test cleanup
+	writerCache := NewTieredCache(writer, time.Minute, time.Minute)
+	defer writerCache.Close() //nolint:errcheck // test cleanup
+
+	reader := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer reader.Close() //nolint:errcheck // test cleanup
+	readerCache := NewTieredCache(reader, time.Minute, time.Minute)
+	defer readerCache.Close() //nolint:errcheck // test cleanup
+	readerCache.SubscribeInvalidations(ctx)
+
+	// Seed the reader's local tier with the stale value, same as if it had
+	// read it before the writer's update below.
+	if err := readerCache.Set(ctx, key, []byte("stale")); err != nil {
+		t.Fatalf("seeding reader: %v", err)
+	}
+
+	if err := writerCache.Set(ctx, key, []byte("fresh")); err != nil {
+		t.Fatalf("writer Set: %v", err)
+	}
+
+	// The invalidation arrives over pubsub asynchronously, so poll instead
+	// of asserting immediately.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := readerCache.local.Get(key); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reader's local copy was never evicted after the writer's Set")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestTieredCache_Set_DoesNotSelfEvict proves a node that both writes and
+// subscribes to its own invalidations, the normal topology when every
+// instance both reads and writes, doesn't undo its own Set: redis pub/sub
+// delivers a publish back to the publisher's own subscription, so without
+// the instanceID tag in invalidationPayload, SubscribeInvalidations would
+// immediately evict the value Set just wrote locally.
+func TestTieredCache_Set_DoesNotSelfEvict(t *testing.T) {
+	tc, _ := newMiniredisTieredCache(t)
+	ctx := context.Background()
+	const key = "key"
+	tc.SubscribeInvalidations(ctx)
+
+	if err := tc.Set(ctx, key, []byte("value")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// Give a buggy self-echo eviction a generous window to happen before
+	// declaring the local copy survived.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, ok := tc.local.Get(key); !ok {
+			t.Fatal("own Set was evicted by this instance's own invalidation publish")
+		}
+	}
+}
+
+// TestTieredCache_Set_CopiesValue proves Set doesn't retain the caller's
+// own slice: mutating value after Set returns, the way reusing a
+// sync.Pool buffer would, must not reach the cached copy.
+func TestTieredCache_Set_CopiesValue(t *testing.T) {
+	tc, _ := newMiniredisTieredCache(t)
+	ctx := context.Background()
+	const key = "key"
+
+	buf := []byte("original")
+	if err := tc.Set(ctx, key, buf); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// Simulate the caller reusing/mutating its buffer after Set returns.
+	for i := range buf {
+		buf[i] = 'X'
+	}
+
+	got, ok := tc.Get(ctx, key)
+	if !ok {
+		t.Fatal("expected a hit")
+	}
+	if string(got) != "original" {
+		t.Fatalf("Get = %q after mutating the caller's buffer, want %q, Set must have copied it", got, "original")
+	}
+}
+
+// TestTieredCache_Get_RedisHitPromotion_CopiesIntoLocal proves a redis-hit
+// promotion doesn't hand the caller the exact slice it just stored in the
+// local tier: mutating what Get returns must not corrupt the promoted
+// local copy a later Get serves.
+func TestTieredCache_Get_RedisHitPromotion_CopiesIntoLocal(t *testing.T) {
+	tc, _ := newMiniredisTieredCache(t)
+	ctx := context.Background()
+	const key = "key"
+
+	if err := tc.Set(ctx, key, []byte("original")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	// Force the next Get through the redis-hit promotion path.
+	tc.local.Delete(key)
+
+	got, ok := tc.Get(ctx, key)
+	if !ok {
+		t.Fatal("expected a hit")
+	}
+	for i := range got {
+		got[i] = 'X'
+	}
+
+	again, ok := tc.Get(ctx, key)
+	if !ok {
+		t.Fatal("expected a hit")
+	}
+	if string(again) != "original" {
+		t.Fatalf("Get = %q after mutating a prior redis-hit result, want %q, the local promotion must have copied it", again, "original")
+	}
+}
+
+// TestTieredCache_GetOrLoad_CopiesLoaderResult proves GetOrLoad doesn't
+// hand the caller the exact slice it just cached from the loader's
+// result: mutating the returned value must not corrupt what's now cached.
+func TestTieredCache_GetOrLoad_CopiesLoaderResult(t *testing.T) {
+	tc, _ := newMiniredisTieredCache(t)
+	ctx := context.Background()
+	const key = "key"
+
+	loader := func(context.Context) ([]byte, error) { return []byte("original"), nil }
+	val, err := tc.GetOrLoad(ctx, key, loader)
+	if err != nil {
+		t.Fatalf("GetOrLoad: %v", err)
+	}
+	for i := range val {
+		val[i] = 'X'
+	}
+
+	got, ok := tc.Get(ctx, key)
+	if !ok {
+		t.Fatal("expected a hit")
+	}
+	if string(got) != "original" {
+		t.Fatalf("Get = %q after mutating GetOrLoad's returned value, want %q, the cache write must have copied it", got, "original")
+	}
+}
+
+// TestTieredCache_GetOrLoad_SlowLoaderDoesNotOverwriteNewerSet reproduces
+// the race a slow loader can hit: GetOrLoad's loader is still running when
+// a concurrent Set for the same key completes with a fresher value. Once
+// the slow loader finally returns its now-stale result, GetOrLoad must not
+// let it clobber what the concurrent Set already wrote, there would be
+// nothing left to correct it afterward. See setIfNewer's doc comment.
+func TestTieredCache_GetOrLoad_SlowLoaderDoesNotOverwriteNewerSet(t *testing.T) {
+	tc, _ := newMiniredisTieredCache(t)
+	ctx := context.Background()
+	const key = "key"
+
+	loaderStarted := make(chan struct{})
+	resumeLoader := make(chan struct{})
+	loader := func(context.Context) ([]byte, error) { //nolint:unparam // error is part of the loader signature GetOrLoad requires, this double never fails
+		close(loaderStarted)
+		<-resumeLoader
+		return []byte("stale"), nil
+	}
+
+	loadDone := make(chan struct{})
+	var loadedVal []byte
+	var loadErr error
+	go func() {
+		defer close(loadDone)
+		loadedVal, loadErr = tc.GetOrLoad(ctx, key, loader)
+	}()
+
+	<-loaderStarted
+
+	// A concurrent write lands while the loader above is still running.
+	if err := tc.Set(ctx, key, []byte("fresh")); err != nil {
+		t.Fatalf("concurrent Set: %v", err)
+	}
+
+	close(resumeLoader)
+	<-loadDone
+
+	if loadErr != nil {
+		t.Fatalf("GetOrLoad: %v", loadErr)
+	}
+	if string(loadedVal) != "stale" {
+		t.Fatalf("GetOrLoad returned %q, want the loader's own result %q", loadedVal, "stale")
+	}
+
+	// The cache itself must still hold the fresher value: the loader's
+	// stale result must never have overwritten it. Force a redis read,
+	// bypassing whatever Set already put in the local tier, to check
+	// redis specifically, the tier this race would otherwise corrupt for
+	// good.
+	tc.local.Delete(key)
+	got, ok := tc.Get(ctx, key)
+	if !ok {
+		t.Fatal("expected a hit")
+	}
+	if string(got) != "fresh" {
+		t.Fatalf("Get = %q after the race, want %q, the stale loader result must not have overwritten it", got, "fresh")
+	}
+
+	if got := tc.Stats().StaleWritesDropped; got != 1 {
+		t.Errorf("StaleWritesDropped = %d, want 1", got)
+	}
+}
+
 func TestNewTieredCache_PanicsWhenBothTiersDisabled(t *testing.T) {
 	defer func() {
 		if recover() == nil {
@@ -364,13 +589,14 @@ func TestTieredCache_Codec_RoundTrip(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	// redis should hold the ENCODED form.
+	// redis should hold the ENCODED form, behind a version prefix.
 	raw, err := client.Get(ctx, key).Bytes()
 	if err != nil {
 		t.Fatalf("reading raw redis value: %v", err)
 	}
-	if len(raw) == 0 || raw[0] != 0xAB {
-		t.Fatalf("expected encoded bytes in redis, got %v", raw)
+	encoded := stripVersion(raw)
+	if len(encoded) == 0 || encoded[0] != 0xAB {
+		t.Fatalf("expected encoded bytes in redis, got %v", encoded)
 	}
 
 	// Force the local tier to miss, so this Get goes through the
@@ -606,14 +832,20 @@ func (h *fakeHistogram) Count() int {
 }
 
 func TestTieredCache_LatencyHistograms(t *testing.T) {
-	t.Run("records local and redis latency on Get and Set", func(t *testing.T) {
+	t.Run("records local, redis, and pubsub latency on Get and Set", func(t *testing.T) {
 		local := &fakeHistogram{}
 		redisHist := &fakeHistogram{}
-		tc, _ := newMiniredisTieredCache(t, WithLocalLatencyHistogram(local), WithRedisLatencyHistogram(redisHist))
+		pubsub := &fakeHistogram{}
+		tc, _ := newMiniredisTieredCache(t,
+			WithLocalLatencyHistogram(local),
+			WithRedisLatencyHistogram(redisHist),
+			WithPubSubLatencyHistogram(pubsub),
+		)
 		ctx := context.Background()
 		const key = "key"
 
-		// Set: one local observation, one redis observation.
+		// Set: one local observation, one redis observation (the write
+		// itself), one pubsub observation (publishing the invalidation).
 		if err := tc.Set(ctx, key, []byte("value")); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
@@ -623,8 +855,12 @@ func TestTieredCache_LatencyHistograms(t *testing.T) {
 		if got := redisHist.Count(); got != 1 {
 			t.Errorf("after Set, redis histogram count = %d, want 1", got)
 		}
+		if got := pubsub.Count(); got != 1 {
+			t.Errorf("after Set, pubsub histogram count = %d, want 1", got)
+		}
 
-		// Local hit: one more local observation, no redis call at all.
+		// Local hit: one more local observation, no redis or pubsub call
+		// at all.
 		if _, ok := tc.Get(ctx, key); !ok {
 			t.Fatal("expected a hit")
 		}
@@ -634,10 +870,14 @@ func TestTieredCache_LatencyHistograms(t *testing.T) {
 		if got := redisHist.Count(); got != 1 {
 			t.Errorf("after local-hit Get, redis histogram count = %d, want 1", got)
 		}
+		if got := pubsub.Count(); got != 1 {
+			t.Errorf("after local-hit Get, pubsub histogram count = %d, want 1", got)
+		}
 
 		// Force a redis round trip: one more local observation (the miss
 		// check), one more redis observation, and one more local
 		// observation (the redis-hit promotion back into the local tier).
+		// Get never publishes, so pubsub stays unchanged.
 		tc.local.Delete(key)
 		if _, ok := tc.Get(ctx, key); !ok {
 			t.Fatal("expected a hit")
@@ -647,6 +887,9 @@ func TestTieredCache_LatencyHistograms(t *testing.T) {
 		}
 		if got := redisHist.Count(); got != 2 {
 			t.Errorf("after redis-hit Get, redis histogram count = %d, want 2", got)
+		}
+		if got := pubsub.Count(); got != 1 {
+			t.Errorf("after redis-hit Get, pubsub histogram count = %d, want 1", got)
 		}
 	})
 

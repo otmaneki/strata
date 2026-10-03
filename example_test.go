@@ -116,6 +116,39 @@ func ExampleWithRedisLatencyHistogram() {
 	// redis observations: 1
 }
 
+// ExampleWithPubSubLatencyHistogram shows tracking invalidation publish
+// latency on its own, separate from ordinary redis data round trips. Both
+// Set and Invalidate publish one invalidation each.
+func ExampleWithPubSubLatencyHistogram() {
+	client, err := newExampleRedisClient()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer client.Close() //nolint:errcheck // example cleanup
+
+	pubsubLatency := &fakeHistogram{}
+	tc := NewTieredCache(client, time.Minute, time.Minute,
+		WithPubSubLatencyHistogram(pubsubLatency),
+	)
+	defer tc.Close() //nolint:errcheck // example cleanup
+
+	ctx := context.Background()
+	if err := tc.Set(ctx, "greeting", []byte("hello")); err != nil {
+		fmt.Println(err)
+		return
+	}
+	if err := tc.Invalidate(ctx, "greeting"); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	fmt.Println("pubsub observations:", pubsubLatency.Count())
+
+	// Output:
+	// pubsub observations: 2
+}
+
 // ExampleTieredCache_GetOrLoad shows the cache-aside pattern: on a miss, the
 // loader is invoked once to populate the cache; a second call for the same
 // key is served without calling the loader again.

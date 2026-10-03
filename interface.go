@@ -11,12 +11,25 @@ type Reader interface {
 	// "not found" result must cover both a genuine miss and any backend
 	// failure. Callers can't tell the two apart from the return value
 	// alone.
+	//
+	// Whether the returned []byte is a copy or the implementation's own
+	// backing array is implementation-defined; check the concrete type's
+	// doc comment before mutating one. TieredCache returns its own
+	// backing array only for a warm local-tier hit, a deliberate
+	// exception to otherwise copying everywhere, see its package doc
+	// comment.
 	Get(ctx context.Context, key string) ([]byte, bool)
 }
 
 // Writer is the write side of Cache: storing a value under a key.
 type Writer interface {
 	// Set writes value under key.
+	//
+	// Whether the implementation copies value or retains the slice
+	// itself is implementation-defined; check the concrete type's doc
+	// comment before reusing or mutating value afterward. TieredCache
+	// copies it, so a buffer pulled from e.g. a sync.Pool is safe to
+	// return to the pool right after calling Set.
 	Set(ctx context.Context, key string, value []byte) error
 }
 
@@ -33,6 +46,11 @@ type Loader interface {
 	// GetOrLoad returns the cached value for key, invoking loader to
 	// populate the cache on a miss. Concurrent calls for the same missing
 	// key should share one loader invocation rather than each calling it.
+	//
+	// Copying semantics for the returned []byte, and for the []byte
+	// loader returns, are implementation-defined the same way Get's and
+	// Set's are; check the concrete type's doc comment. TieredCache
+	// copies the loader's result before caching it.
 	GetOrLoad(ctx context.Context, key string, loader func(ctx context.Context) ([]byte, error)) ([]byte, error)
 }
 

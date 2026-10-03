@@ -8,11 +8,8 @@ import "sync/atomic"
 // and never reset; scrape periodically and let your metrics system compute
 // rates and deltas, the way Prometheus-style counters are meant to be read.
 //
-// Latency isn't tracked here. Counting is cheap with a plain atomic
-// increment per event, but a meaningful latency measurement needs a real
-// histogram, which is a job for whatever metrics library you're already
-// using, not something to reimplement here. Wire it up via Observer
-// instead once that's in place.
+// Latency isn't tracked here, that's what WithLocalLatencyHistogram,
+// WithRedisLatencyHistogram, and WithPubSubLatencyHistogram are for.
 type Stats struct {
 	// LocalHits and LocalMisses count local-tier lookups in Get. Both stay
 	// zero if WithoutLocalCache is used, since there's no local tier to
@@ -32,10 +29,18 @@ type Stats struct {
 	EncodeErrors uint64
 	DecodeErrors uint64
 
-	// SetErrors counts GetOrLoad's internal Set failing after a successful
-	// loader call. See Observer.OnSetError's doc comment for why that
-	// fails open instead of returning the error to GetOrLoad's caller.
+	// SetErrors counts GetOrLoad's internal cache-population call failing
+	// after a successful loader call. See Observer.OnSetError's doc
+	// comment for why that fails open instead of returning the error to
+	// GetOrLoad's caller.
 	SetErrors uint64
+
+	// StaleWritesDropped counts GetOrLoad discarding a loader's result
+	// instead of caching it, because a newer write for the same key
+	// landed in redis while the loader was still running. See
+	// setIfNewer's doc comment. The loader's result is still returned to
+	// its caller either way, only the cache write is skipped.
+	StaleWritesDropped uint64
 }
 
 // tieredStats holds Stats's counters as atomics, incremented inline on
@@ -47,17 +52,19 @@ type tieredStats struct {
 	redisHits, redisMisses, redisErrors atomic.Int64
 	encodeErrors, decodeErrors          atomic.Int64
 	setErrors                           atomic.Int64
+	staleWritesDropped                  atomic.Int64
 }
 
 func (s *tieredStats) snapshot() Stats {
 	return Stats{
-		LocalHits:    uint64(s.localHits.Load()),
-		LocalMisses:  uint64(s.localMisses.Load()),
-		RedisHits:    uint64(s.redisHits.Load()),
-		RedisMisses:  uint64(s.redisMisses.Load()),
-		RedisErrors:  uint64(s.redisErrors.Load()),
-		EncodeErrors: uint64(s.encodeErrors.Load()),
-		DecodeErrors: uint64(s.decodeErrors.Load()),
-		SetErrors:    uint64(s.setErrors.Load()),
+		LocalHits:          uint64(s.localHits.Load()),
+		LocalMisses:        uint64(s.localMisses.Load()),
+		RedisHits:          uint64(s.redisHits.Load()),
+		RedisMisses:        uint64(s.redisMisses.Load()),
+		RedisErrors:        uint64(s.redisErrors.Load()),
+		EncodeErrors:       uint64(s.encodeErrors.Load()),
+		DecodeErrors:       uint64(s.decodeErrors.Load()),
+		SetErrors:          uint64(s.setErrors.Load()),
+		StaleWritesDropped: uint64(s.staleWritesDropped.Load()),
 	}
 }

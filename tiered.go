@@ -1,12 +1,31 @@
 // Package strata implements a two-tier cache: an in-process local cache in
 // front of redis, with pubsub-driven invalidation so a write on one node
 // evicts the stale copy cached on others.
+//
+// Set, GetOrLoad's cache write, and a redis-hit promotion inside Get all
+// store their own copy in the local tier, so mutating or reusing a buffer
+// (e.g. one pulled from a sync.Pool) after handing it to this package, or
+// mutating a []byte this package just handed back, is safe: neither can
+// reach back into what's cached. The one deliberate exception is a warm
+// local hit inside Get: it returns the local tier's own backing array
+// directly, not a copy, because copying on every local hit would undo
+// most of the point of having a lock-free local tier at all. Mutating
+// that particular returned slice in place does corrupt the cached value
+// for every other caller that hits the same key afterward, silently,
+// until the key is next overwritten or evicted. Treat it as read-only,
+// and copy it yourself, e.g. with bytes.Clone, before mutating it. The
+// generic GetOrLoad[T]/WithCache layer doesn't have this problem either
+// way: Marshaler.Unmarshal decodes into a fresh T on every call.
 package strata
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -52,11 +71,38 @@ type TieredCache struct {
 	stats tieredStats
 
 	// redisLatency and localLatency, if set, receive a latency observation
-	// in seconds for every redis round trip and every local tier lookup,
-	// respectively. Both are nil by default, meaning nothing is recorded.
-	// Set via WithRedisLatencyHistogram and WithLocalLatencyHistogram.
-	redisLatency Histogram
-	localLatency Histogram
+	// in seconds for every redis data round trip (Get, Set, Del) and every
+	// local tier lookup, respectively. pubsubLatency, if set, receives one
+	// for every invalidation publish instead, kept separate since a
+	// publish is a fire-and-forget broadcast, not a data read/write, and
+	// usually has different latency characteristics worth tracking on its
+	// own. All three are nil by default, meaning nothing is recorded. Set
+	// via WithRedisLatencyHistogram, WithLocalLatencyHistogram, and
+	// WithPubSubLatencyHistogram.
+	redisLatency  Histogram
+	localLatency  Histogram
+	pubsubLatency Histogram
+
+	// instanceID tags every invalidation this instance publishes, so its
+	// own SubscribeInvalidations loop can tell its own publishes apart
+	// from another instance's and skip them. Without this, a node that
+	// both writes and subscribes would evict its own freshly written local
+	// entry on every Set, since redis pub/sub delivers a publish back to
+	// the publisher's own subscription too. Generated once in
+	// NewTieredCache.
+	instanceID string
+}
+
+// newInstanceID returns a random identifier for tagging this TieredCache's
+// published invalidations. crypto/rand.Read failing is effectively
+// unreachable on supported platforms, the fallback just keeps construction
+// from panicking over it rather than producing a meaningfully better id.
+func newInstanceID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%016x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 // Option configures optional TieredCache behavior.
@@ -115,11 +161,22 @@ func WithCodec(c Codec) Option {
 }
 
 // WithRedisLatencyHistogram registers a Histogram that records how long
-// each redis round trip takes, in seconds: every Get, Set, Del, and
-// Publish call. Without this option, redis latency isn't recorded
-// anywhere. No effect if WithoutRedis is also used.
+// each redis data round trip takes, in seconds: every Get, Set, and Del
+// call. It does not include invalidation publishes, see
+// WithPubSubLatencyHistogram for those. Without this option, redis latency
+// isn't recorded anywhere. No effect if WithoutRedis is also used.
 func WithRedisLatencyHistogram(h Histogram) Option {
 	return func(tc *TieredCache) { tc.redisLatency = h }
+}
+
+// WithPubSubLatencyHistogram registers a Histogram that records how long
+// each invalidation publish takes, in seconds: the Publish call inside Set
+// and Invalidate. Kept separate from WithRedisLatencyHistogram since a
+// publish is a fire-and-forget broadcast rather than a data read/write, and
+// often behaves differently under load. Without this option, publish
+// latency isn't recorded anywhere. No effect if WithoutRedis is also used.
+func WithPubSubLatencyHistogram(h Histogram) Option {
+	return func(tc *TieredCache) { tc.pubsubLatency = h }
 }
 
 // WithLocalLatencyHistogram registers a Histogram that records how long
@@ -152,6 +209,7 @@ func NewTieredCache(rc *redis.Client, localTTL, remoteTTL time.Duration, opts ..
 		localEnabled:            true,
 		remoteEnabled:           true,
 		observer:                NoopObserver{},
+		instanceID:              newInstanceID(),
 	}
 	for _, opt := range opts {
 		opt(tc)
@@ -226,10 +284,39 @@ func (tc *TieredCache) observeRedisLatency(start time.Time) {
 	}
 }
 
+// startPubSubTimer is startLocalTimer's invalidation-publish counterpart,
+// see its doc comment.
+func (tc *TieredCache) startPubSubTimer() time.Time {
+	if tc.pubsubLatency == nil {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+// observePubSubLatency reports how long an invalidation publish took,
+// given a start time from startPubSubTimer. A no-op if no pub/sub latency
+// Histogram is registered.
+func (tc *TieredCache) observePubSubLatency(start time.Time) {
+	if tc.pubsubLatency != nil {
+		tc.pubsubLatency.Observe(time.Since(start).Seconds())
+	}
+}
+
+// invalidationPayload builds the pubsub message published for key,
+// prefixed with this instance's id so SubscribeInvalidations can recognize
+// and skip its own publishes. See instanceID's doc comment.
+func (tc *TieredCache) invalidationPayload(key string) string {
+	return tc.instanceID + ":" + key
+}
+
 // Get looks up key, checking the local tier first (unless WithoutLocalCache
 // was used) and falling back to redis (unless WithoutRedis was used). A
 // redis hit is promoted into the local tier so the next Get for the same
 // key is served locally.
+//
+// A warm local hit returns the local tier's own backing array directly,
+// not a copy, see the package doc comment. A redis hit doesn't have this
+// problem, that []byte is freshly decoded for this call alone.
 func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 	// Tier 1: Local memory
 	if tc.localEnabled {
@@ -261,9 +348,10 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 	switch {
 	case err == nil:
 		tc.stats.redisHits.Add(1)
-		decoded := val
+		data := stripVersion(val)
+		decoded := data
 		if tc.codec != nil {
-			decoded, err = tc.codec.Decode(val)
+			decoded, err = tc.codec.Decode(data)
 			if err != nil {
 				tc.stats.decodeErrors.Add(1)
 				tc.observer.OnDecodeError(err)
@@ -277,9 +365,12 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 			// Local always holds the decoded value, never the encoded
 			// wire format, so a later warm Get doesn't need to decode
 			// again and doesn't return raw/compressed bytes to the
-			// caller.
+			// caller. Stored as its own copy, same reasoning as Set: the
+			// caller is about to get this exact decoded slice back too,
+			// and mutating a returned slice must not reach back into
+			// what's now cached.
 			localStart := tc.startLocalTimer()
-			tc.local.Set(key, decoded, tc.localTTL)
+			tc.local.Set(key, bytes.Clone(decoded), tc.localTTL)
 			tc.observeLocalLatency(localStart)
 		}
 		return decoded, true
@@ -297,13 +388,35 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 	}
 }
 
-// Set writes value under key to whichever tiers are enabled. The local tier
-// always stores value as-is; if a Codec is configured, the redis tier
-// stores the encoded form instead.
+// Set writes value under key to whichever tiers are enabled. The local
+// tier stores its own copy of value, so it's safe to mutate or reuse
+// value (e.g. a buffer pulled from a sync.Pool) after Set returns. If a
+// Codec is configured, the redis tier stores the encoded form instead,
+// tagged with the current time so a slower concurrent write never
+// clobbers it, see setIfNewer's doc comment.
+// If both tiers are enabled, it also publishes an invalidation, the same
+// one Invalidate sends, so other nodes subscribed via
+// SubscribeInvalidations drop their now-stale local copy instead of
+// serving it until localTTL expires. It returns before publishing if the
+// redis write itself fails, since announcing an invalidation for a write
+// that never happened would be misleading.
+//
+// Set itself always applies, regardless of ordering: it's an explicit
+// request to store this value now, not a conditional one. The version tag
+// exists so a later GetOrLoad call, specifically one whose loader was
+// already running when this Set happened, can tell its own result is now
+// stale and avoid overwriting what Set just wrote.
 func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error {
 	if tc.localEnabled {
+		// A defensive copy: value may be a buffer the caller reuses (e.g.
+		// pulled from a sync.Pool) or mutates after this call returns, and
+		// the local tier retains whatever it's given directly rather than
+		// copying it itself, see cache.go's localCache doc comment.
+		// Cloning once here, instead of requiring every caller to copy
+		// before calling Set, is what makes Set safe to call with a
+		// buffer the caller doesn't exclusively own anymore afterward.
 		localStart := tc.startLocalTimer()
-		tc.local.Set(key, value, tc.localTTL)
+		tc.local.Set(key, bytes.Clone(value), tc.localTTL)
 		tc.observeLocalLatency(localStart)
 	}
 
@@ -323,8 +436,15 @@ func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error 
 	}
 
 	redisStart := tc.startRedisTimer()
-	err := tc.redis.Set(ctx, key, toStore, tc.remoteTTL).Err()
+	err := tc.redis.Set(ctx, key, versionedPayload(time.Now().UnixNano(), toStore), tc.remoteTTL).Err()
 	tc.observeRedisLatency(redisStart)
+	if err != nil {
+		return err
+	}
+
+	pubStart := tc.startPubSubTimer()
+	err = tc.redis.Publish(ctx, invalidationPubSubChannel, tc.invalidationPayload(key)).Err()
+	tc.observePubSubLatency(pubStart)
 	return err
 }
 
@@ -352,16 +472,16 @@ func (tc *TieredCache) Invalidate(ctx context.Context, key string) error {
 		return fmt.Errorf("delete %s from redis: %w", key, err)
 	}
 
-	pubStart := tc.startRedisTimer()
-	err = tc.redis.Publish(ctx, invalidationPubSubChannel, key).Err()
-	tc.observeRedisLatency(pubStart)
+	pubStart := tc.startPubSubTimer()
+	err = tc.redis.Publish(ctx, invalidationPubSubChannel, tc.invalidationPayload(key)).Err()
+	tc.observePubSubLatency(pubStart)
 	return err
 }
 
 // SubscribeInvalidations starts listening for invalidations published by
-// Invalidate, on this node or others, and evicts the affected key from
-// the local tier. Call it at most once per TieredCache; call Close to stop
-// it.
+// Set and Invalidate, on this node or others, and evicts the affected key
+// from the local tier. Call it at most once per TieredCache; call Close to
+// stop it.
 //
 // It's a no-op if either tier is disabled: with no local tier there's
 // nothing to invalidate locally, and with no redis tier there's no pubsub
@@ -373,7 +493,19 @@ func (tc *TieredCache) SubscribeInvalidations(ctx context.Context) {
 	tc.sub = tc.redis.Subscribe(ctx, invalidationPubSubChannel)
 	go func() {
 		for msg := range tc.sub.Channel() {
-			tc.local.Delete(msg.Payload)
+			origin, key, found := strings.Cut(msg.Payload, ":")
+			if !found {
+				// No instance id prefix, treat the whole payload as the
+				// key rather than drop it.
+				key = origin
+			} else if origin == tc.instanceID {
+				// This instance published it: redis pub/sub delivers a
+				// publish back to the publisher's own subscription, and
+				// Set/Invalidate already applied the change locally
+				// before publishing, so there's nothing to do here.
+				continue
+			}
+			tc.local.Delete(key)
 		}
 	}()
 }
@@ -388,6 +520,10 @@ func (tc *TieredCache) SubscribeInvalidations(ctx context.Context) {
 //	    }
 //	    return json.Marshal(u)
 //	})
+//
+// The []byte loader returns is copied before it's cached, and so is the
+// []byte Set itself ever stores; see the package doc comment for the one
+// remaining exception, a warm hit served straight from Get.
 func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ctx context.Context) ([]byte, error)) ([]byte, error) {
 	if val, ok := tc.Get(ctx, key); ok {
 		return val, nil
@@ -401,6 +537,12 @@ func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ct
 			return val, nil
 		}
 
+		// Recorded before the loader runs, not after: the loader can be
+		// slow, and if a Set for this key lands while it's still running,
+		// that Set's version will be newer. Stamping the load's version
+		// from before it started, rather than after it finished, is what
+		// lets setIfNewer tell the two apart and reject the stale one.
+		loadStart := time.Now().UnixNano()
 		val, err := loader(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("loader for key %s: %w", key, err)
@@ -410,7 +552,20 @@ func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ct
 		// good, so a cache-population failure shouldn't fail this call
 		// too. Report it via the observer instead of the return value,
 		// see Observer.OnSetError's doc comment.
-		if err := tc.Set(ctx, key, val); err != nil {
+		if tc.remoteEnabled {
+			// setIfNewer, not Set: a concurrent write for this key that
+			// completed while the loader was still running must win, see
+			// its doc comment. WithoutRedis has no such concurrent writer
+			// to race against, local tier writes are already
+			// last-write-wins there, so Set's plain behavior is fine.
+			switch applied, err := tc.setIfNewer(ctx, key, val, loadStart); {
+			case err != nil:
+				tc.stats.setErrors.Add(1)
+				tc.observer.OnSetError(fmt.Errorf("set key %s: %w", key, err))
+			case !applied:
+				tc.stats.staleWritesDropped.Add(1)
+			}
+		} else if err := tc.Set(ctx, key, val); err != nil {
 			tc.stats.setErrors.Add(1)
 			tc.observer.OnSetError(fmt.Errorf("set key %s: %w", key, err))
 		}
