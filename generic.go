@@ -5,26 +5,18 @@ import (
 	"fmt"
 )
 
-// GetOrLoad is the generic sibling of Cache's byte-oriented GetOrLoad
-// method. It can't be a method itself. Go doesn't allow a method to
-// declare its own type parameters, so it takes the Cache to operate on as
-// an argument instead, and marshals/unmarshals T via m so callers stop
-// hand-rolling json.Marshal/Unmarshal (or any other format) around every
-// call site.
+// GetOrLoad is Cache.GetOrLoad's generic sibling, marshaling/unmarshaling
+// T via m instead of taking c as a method (Go methods can't add their
+// own type parameters):
 //
-// It delegates to c.GetOrLoad for the actual fetch, so it gets that
-// method's behavior for free: singleflight-deduped loader calls, and
-// failing open (returning the loaded value even if caching it afterward
-// fails).
+//	user, err := strata.GetOrLoad(ctx, tc, strata.JSONMarshaler[User]{}, "user:1234",
+//	    func(ctx context.Context) (User, error) { return db.GetUser(ctx, 1234) },
+//	)
 //
-// A value found in the cache that m can't unmarshal is treated as a real
-// error, not a miss to silently retry: unlike a wire-level decode failure
-// inside Get (which fails open because the bytes were never valid to begin
-// with), reaching here means c.GetOrLoad already returned successfully,
-// either a genuine hit, or a value this exact call just marshaled and
-// stored, so a failure to read it back means whatever's stored under key
-// doesn't match what this Marshaler/T expects, and retrying via loader
-// would hit the exact same stale bytes again without evicting them first.
+// An Unmarshal failure on a cache hit is returned as an error, not
+// retried as a miss: the bytes came from c.GetOrLoad succeeding, so
+// they're exactly what was last stored under key, and the loader would
+// just hit the same bytes again.
 func GetOrLoad[T any](ctx context.Context, c Cache, m Marshaler[T], key string, loader func(context.Context) (T, error)) (T, error) {
 	var zero T
 

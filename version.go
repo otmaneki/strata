@@ -11,20 +11,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// versionKeyPrefix namespaces the redis key that holds a cache key's
-// version counter, kept entirely separate from the value itself. The
-// value redis stores under key is always exactly what was given to Set
-// or produced by a GetOrLoad loader, byte for byte, nothing prepended or
-// wrapped around it. That matters for two reasons: another service
-// reading these keys directly sees the same bytes it always would, and
-// upgrading to a version of this package that didn't have versioning
-// doesn't corrupt whatever's already sitting in redis. An earlier
-// version of this file embedded the version as a "<nanoseconds>:<data>"
-// prefix on the value itself, which broke both of those: any value
-// containing a colon, which is most JSON and plenty of binary payloads,
-// got silently truncated on read.
-//
-// Reserve keys starting with this prefix for this package; don't use it
+// versionKeyPrefix namespaces each key's version counter in a separate
+// redis key, so the value stored under the caller's own key is always
+// exactly what was given to Set, byte for byte. An earlier version
+// embedded the version as a "<nanoseconds>:<data>" prefix on the value
+// itself, which silently truncated any value containing a colon, most
+// JSON included, on read. Don't use keys starting with this prefix
 // yourself.
 const versionKeyPrefix = "strata:ver:"
 
@@ -32,15 +24,12 @@ func versionKey(key string) string {
 	return versionKeyPrefix + key
 }
 
-// setScript atomically writes ARGV[1] under KEYS[1] (the value key) and
-// increments KEYS[2] (its version counter), returning the new version.
-// KEYS[2] is never deleted and (deliberately) never expires on its own:
-// it's redis's own monotonic clock for this key, immune to the clock
-// skew a wall-clock timestamp version would be exposed to across
-// instances. A plain SET followed by a separate INCR wouldn't be safe
-// here: a setIfVersion call for this same key, running concurrently,
-// could observe the new value alongside the old version in the gap
-// between the two commands, and wrongly conclude nothing has changed.
+// setScript atomically writes ARGV[1] under KEYS[1] and increments
+// KEYS[2], the version counter, redis's own monotonic clock for this
+// key, immune to clock skew between instances. Atomic matters: a plain
+// SET then separate INCR would let a concurrent setIfVersion observe the
+// new value alongside the old version and wrongly conclude nothing
+// changed.
 var setScript = redis.NewScript(`
 redis.call('SET', KEYS[1], ARGV[1])
 if tonumber(ARGV[2]) > 0 then
@@ -49,22 +38,17 @@ end
 return redis.call('INCR', KEYS[2])
 `)
 
-// delScript atomically deletes KEYS[1] (the value key) and increments
-// KEYS[2] (its version counter). The increment matters as much as the
-// delete: without it, a setIfVersion call already in flight for this
-// key, holding a version captured before the delete, would see an
-// unchanged version and resurrect the deleted value right back into
-// redis.
+// delScript atomically deletes KEYS[1] and increments KEYS[2], the
+// version counter. Without the increment, a setIfVersion already in
+// flight would see no change and resurrect the deleted value.
 var delScript = redis.NewScript(`
 redis.call('DEL', KEYS[1])
 return redis.call('INCR', KEYS[2])
 `)
 
-// casScript atomically writes ARGV[1] under KEYS[1] (the value key) and
-// increments KEYS[2] (its version counter), but only if KEYS[2]'s current
-// value still equals ARGV[2], the version observed before this write was
-// decided. Returns 1 if it applied, 0 if it was rejected because the
-// version had already moved on. See setIfVersion's doc comment.
+// casScript writes ARGV[1] under KEYS[1] and increments KEYS[2] only if
+// KEYS[2] still equals ARGV[2]; returns 1 if applied, 0 if rejected as
+// stale. See setIfVersion.
 var casScript = redis.NewScript(`
 local current = redis.call('GET', KEYS[2])
 if current == false then
@@ -81,10 +65,7 @@ redis.call('INCR', KEYS[2])
 return 1
 `)
 
-// currentVersion returns key's current version counter, or 0 if it has
-// none yet (a key that's never been written, or was written before
-// versioning existed). GetOrLoad calls this before running its loader,
-// to capture the baseline setIfVersion later checks against.
+// currentVersion returns key's version counter, or 0 if it has none yet.
 func (tc *TieredCache) currentVersion(ctx context.Context, key string) (int64, error) {
 	redisStart := tc.startRedisTimer()
 	s, err := tc.redis.Get(ctx, versionKey(key)).Result()
@@ -102,21 +83,12 @@ func (tc *TieredCache) currentVersion(ctx context.Context, key string) (int64, e
 	return v, nil
 }
 
-// setIfVersion writes value under key, encoded through the configured
-// Codec the same way Set does, but only if key's version counter still
-// equals expectedVersion, the value currentVersion returned before
-// GetOrLoad's loader ran. It's GetOrLoad's replacement for a plain Set
-// after the loader returns: a loader can be slow, and if a concurrent
-// Set, Invalidate, or another GetOrLoad already touched this key while
-// this one was still running, blindly overwriting it with the slow
-// loader's now-stale result would leave redis permanently wrong, nothing
-// would ever notice or correct it.
-//
-// On a successful write, it also updates the local tier and publishes an
-// invalidation, the same as Set. On a rejected write, it touches neither:
-// promoting a value redis just refused as stale into this instance's own
-// local tier would serve it until localTTL expires, exactly the bug this
-// exists to avoid.
+// setIfVersion is GetOrLoad's replacement for Set after its loader
+// returns: it writes value only if key's version still equals
+// expectedVersion (from currentVersion, read before the loader ran).
+// Otherwise a concurrent write already landed, and applying the loader's
+// now-stale result would leave redis wrong with nothing left to correct
+// it. A rejected write touches neither the local tier nor pub/sub.
 func (tc *TieredCache) setIfVersion(ctx context.Context, key string, value []byte, expectedVersion int64) (applied bool, err error) {
 	toStore := value
 	if tc.codec != nil {
@@ -147,9 +119,6 @@ func (tc *TieredCache) setIfVersion(ctx context.Context, key string, value []byt
 	}
 
 	if tc.localEnabled {
-		// A defensive copy, same reasoning as Set: value is the loader's
-		// own result, returned to GetOrLoad's caller as well as stored
-		// here, and the local tier retains whatever it's given directly.
 		localStart := tc.startLocalTimer()
 		tc.local.Set(key, bytes.Clone(value), tc.localTTL)
 		tc.observeLocalLatency(localStart)

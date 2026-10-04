@@ -4,6 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sys/cpu"
 )
 
 type entry struct {
@@ -11,21 +13,22 @@ type entry struct {
 	expiresAt time.Time
 }
 
-// localCache is an in-process, TTL-based cache with an approximate size
-// bound. It's built on sync.Map for lock-free reads, which is why the bound
-// is "best effort" rather than exact: sync.Map doesn't track insertion or
-// access order, so eviction picks an arbitrary victim rather than the
-// least-recently-used one, and the grow-then-evict sequence in Set isn't
-// atomic under concurrent writers. For a cache (not an authoritative store)
-// that trade-off is the right one, it keeps reads free of locking.
+// localCache is a sync.Map-backed, TTL-based cache with an approximate
+// size bound: sync.Map doesn't track access order, so eviction is
+// best-effort, not LRU, in exchange for lock-free reads.
 type localCache struct {
-	data sync.Map
-	// maxSize <= 0 means unbounded: no eviction on write
-	// basically a fancy memory leak :D
-	maxSize  int
+	data     sync.Map
 	size     atomic.Int64
 	stop     chan struct{}
 	stopOnce sync.Once
+
+	// Padded onto its own cache line: read on every Set but written only
+	// once, at construction, so it shouldn't bounce between cores
+	// alongside size's frequent atomic writes.
+	// maxSize <= 0 means unbounded, a fancy memory leak :D
+	_       cpu.CacheLinePad
+	maxSize int
+	_       cpu.CacheLinePad
 }
 
 // newLocalCache starts a localCache along with its background TTL sweeper.
