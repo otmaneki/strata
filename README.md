@@ -210,7 +210,8 @@ More runnable examples for every option live in `example_test.go`.
   a warm local read never pays an encode/decode cost. The value redis
   stores under the key is always exactly what was given to `Set`, nothing
   prepended or wrapped around it; the version lives in a separate,
-  `strata:ver:`-prefixed key redis owns.
+  `strata:ver:`-prefixed key redis owns, hash-tagged (`{key}`) so it
+  shares a Cluster slot with the value key.
 - **`Invalidate`** deletes locally, then atomically deletes the redis key
   and bumps its version counter (`delScript`), then publishes the key on
   a pub/sub channel. Every instance that called `SubscribeInvalidations`
@@ -238,7 +239,11 @@ More runnable examples for every option live in `example_test.go`.
   loaded value afterward fails outright (a redis error, not a staleness
   rejection), the loaded value is still returned, the loader already did
   the real work, so a redis write failure shouldn't fail the caller's
-  request on top of it.
+  request on top of it. The shared loader call runs on a context
+  detached from any single caller's cancellation, bounded instead by
+  `WithLoaderTimeout` (default 30s), so one caller giving up doesn't
+  abort work the others sharing it still need. A panicking loader is
+  recovered and returned as an error rather than crashing the process.
 - **The local tier** is a `sync.Map` with an approximate size bound and a
   background TTL sweep, lock-free reads and best-effort eviction (no LRU
   ordering, since `sync.Map` doesn't track access order), documented as
@@ -275,17 +280,14 @@ nothing shared to corrupt.
 
 ## Benchmarks
 
-Run with `make bench` (`go test -bench . -benchmem`, default `-benchtime`).
-By default that's against an in-process miniredis instance, which is
-convenient for the test suite but a poor stand-in for these specific
-numbers: `Set`, `Invalidate`, and `GetOrLoad`'s write path now run a
-small Lua script in redis (see "How it works" above), and miniredis's
-Lua support is a pure-Go VM that spins up fresh per call, at a few
-hundred allocations each, dwarfing everything else being measured. Real
-redis runs that same script server-side, where it costs about what any
-other command does. The numbers below are from a real redis instead
-(`make bench REDIS_ADDR=host:port`, here a local `redis:7-alpine`
-container), to actually show that.
+Run with `make bench REDIS_ADDR=host:port` (`go test -bench . -benchmem`,
+default `-benchtime`) against a real redis; there's no fake in-process
+stand-in. That matters for these specific numbers: `Set`, `Invalidate`,
+and `GetOrLoad`'s write path run a small Lua script in redis (see "How it
+works" above), and a pure-Go Lua reimplementation would spin up a fresh
+VM per call, at a few hundred allocations each, dwarfing everything else
+being measured. Real redis runs that script server-side, where it costs
+about what any other command does, and the numbers below reflect that.
 
 To get your own redis instance and reproduce them:
 
@@ -351,8 +353,8 @@ BenchmarkWithCache-16                         1672387     1376 ns/op    152 B/op
 - **`Set` (245µs, 29 allocs) costs about 2.5x a plain redis `Set` (97µs,
   9 allocs).** That's the version-bumping Lua script plus the
   invalidation publish, both real redis round trips on top of the local
-  write, not free, but nowhere near the hundreds of allocations the same
-  benchmark shows under miniredis.
+  write, not free, but nowhere near what a pure-Go Lua reimplementation
+  would cost, see the intro above.
 - **`GetOrLoadContended` proves the singleflight dedup**: 32 goroutines
   racing a cold key produce exactly **1.000 loader calls per round**,
   versus **32.00** without it (`GetOrLoadContendedNoDedup`), and roughly
@@ -369,11 +371,17 @@ BenchmarkWithCache-16                         1672387     1376 ns/op    152 B/op
 
 ```
 make build   # go build ./...
-make test    # go test -v -count=1 ./...
+make test    # go test -v -race -count=1 ./...
 make vet     # go vet ./...
 make fmt     # gofmt -l .
-make bench   # all benchmarks, against miniredis by default
+make bench   # all benchmarks
 ```
+
+`test` and every `bench*` target except `bench-local` need a real redis
+reachable at `REDIS_ADDR=host:port`, e.g.
+`make test REDIS_ADDR=localhost:6379`; nothing fakes one for you. CI runs
+the test suite against a `redis:7-alpine` service container, see
+`.github/workflows/go.yml`.
 
 Linting uses [golangci-lint](https://golangci-lint.run) with the config in
 `.golangci.yaml`:

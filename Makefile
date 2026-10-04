@@ -3,13 +3,12 @@
 build:
 	go build ./...
 
+# Everything except bench-local needs a real redis reachable at
+# REDIS_ADDR=host:port, e.g.:
+#   make test REDIS_ADDR=localhost:6379
 test:
-	go test -v -count=1 ./...
+	REDIS_ADDR=$(REDIS_ADDR) go test -v -race -count=1 ./...
 
-# Runs all three benchmark suites (redis-only, local-only, tiered) against
-# an in-process miniredis instance. Pass REDIS_ADDR=host:port to target a
-# real redis server instead, e.g.:
-#   make bench REDIS_ADDR=localhost:6379
 bench:
 	REDIS_ADDR=$(REDIS_ADDR) go test ./... -run '^$$' -bench . -benchmem
 

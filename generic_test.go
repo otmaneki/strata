@@ -15,7 +15,7 @@ type testUser struct {
 }
 
 func TestGetOrLoad_Generic_RoundTrip(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 
 	var loaderCalls int64
@@ -45,7 +45,7 @@ func TestGetOrLoad_Generic_RoundTrip(t *testing.T) {
 }
 
 func TestGetOrLoad_Generic_DedupsConcurrentMisses(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 
 	var loaderCalls int64
@@ -74,7 +74,7 @@ func TestGetOrLoad_Generic_DedupsConcurrentMisses(t *testing.T) {
 }
 
 func TestGetOrLoad_Generic_LoaderErrorPropagates(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 
 	boom := errors.New("boom")
@@ -87,7 +87,7 @@ func TestGetOrLoad_Generic_LoaderErrorPropagates(t *testing.T) {
 }
 
 func TestGetOrLoad_Generic_IncompatibleCachedValueIsAnError(t *testing.T) {
-	tc, client := newMiniredisTieredCache(t)
+	tc, client := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "user:1234"
 
@@ -114,7 +114,7 @@ func TestGetOrLoad_Generic_IncompatibleCachedValueIsAnError(t *testing.T) {
 }
 
 func TestWithCache_MemoizesPerArgument(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 
 	var loaderCalls int64
@@ -161,7 +161,7 @@ func TestWithCache_MemoizesPerArgument(t *testing.T) {
 // tests exist to prove rather than assume.
 
 func TestGetOrLoad_Generic_ComposesWithWithoutLocalCache(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t, WithoutLocalCache())
+	tc, _ := newTestTieredCache(t, WithoutLocalCache())
 	ctx := context.Background()
 
 	var loaderCalls int64

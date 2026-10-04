@@ -20,8 +20,17 @@ import (
 // yourself.
 const versionKeyPrefix = "strata:ver:"
 
+// versionKey wraps key in a redis Cluster hash tag ("{...}"), so it hashes
+// to the same slot as the plain, unwrapped value key: Cluster hashes only
+// the substring between the first '{' and '}' when present, which here is
+// exactly key itself, the same thing a brace-less value key hashes on. The
+// two-key Lua scripts below would otherwise hit CROSSSLOT errors against a
+// real cluster. This breaks down only if key itself already contains its
+// own '{...}' hash tag; there's no way to colocate with an unwrapped value
+// key while respecting a caller-chosen hash tag that isn't key's own full
+// content.
 func versionKey(key string) string {
-	return versionKeyPrefix + key
+	return versionKeyPrefix + "{" + key + "}"
 }
 
 // setScript atomically writes ARGV[1] under KEYS[1] and increments

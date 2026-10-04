@@ -4,13 +4,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
+
+// testRedisAddr returns REDIS_ADDR, flushed first so every test starts
+// from an empty database. The suite needs a real redis reachable there,
+// e.g. `REDIS_ADDR=localhost:6379 go test ./...`; point it at whatever
+// instance you've already got running, locally or in CI.
+func testRedisAddr(t *testing.T) string {
+	t.Helper()
+
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		t.Fatal("REDIS_ADDR must be set to a reachable redis instance, e.g. REDIS_ADDR=localhost:6379")
+	}
+
+	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{addr}})
+	defer client.Close() //nolint:errcheck // test cleanup
+	if err := client.FlushAll(context.Background()).Err(); err != nil {
+		t.Fatalf("flushing REDIS_ADDR=%s before test: %v", addr, err)
+	}
+	return addr
+}
 
 func TestLocalCache_EnforcesMaxSize(t *testing.T) {
 	c := newLocalCache(3, time.Hour)
@@ -175,16 +196,10 @@ func (o observerFunc) OnSetError(err error) {
 	}
 }
 
-func newMiniredisTieredCache(t *testing.T, opts ...Option) (*TieredCache, *redis.Client) {
+func newTestTieredCache(t *testing.T, opts ...Option) (*TieredCache, redis.UniversalClient) {
 	t.Helper()
 
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("could not start miniredis: %v", err)
-	}
-	t.Cleanup(mr.Close)
-
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{testRedisAddr(t)}})
 	t.Cleanup(func() { _ = client.Close() })
 
 	tc := NewTieredCache(client, time.Minute, time.Minute, opts...)
@@ -194,7 +209,7 @@ func newMiniredisTieredCache(t *testing.T, opts ...Option) (*TieredCache, *redis
 
 func TestTieredCache_Get_PlainMissDoesNotTriggerErrorHandler(t *testing.T) {
 	called := false
-	tc, _ := newMiniredisTieredCache(t, WithObserver(observerFunc{onRedisError: func(error) { called = true }}))
+	tc, _ := newTestTieredCache(t, WithObserver(observerFunc{onRedisError: func(error) { called = true }}))
 
 	if _, ok := tc.Get(context.Background(), "does-not-exist"); ok {
 		t.Fatal("expected a cache miss")
@@ -207,7 +222,7 @@ func TestTieredCache_Get_PlainMissDoesNotTriggerErrorHandler(t *testing.T) {
 func TestTieredCache_Get_RedisFailureTriggersErrorHandler(t *testing.T) {
 	// Nothing listens on this port, so every redis call fails outright; a
 	// short deadline keeps the test fast regardless of environment.
-	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{"127.0.0.1:1"}})
 	defer client.Close() //nolint:errcheck // This is just a test file ffs
 
 	var gotErr error
@@ -236,7 +251,7 @@ func TestTieredCache_Get_RedisFailureTriggersErrorHandler(t *testing.T) {
 func TestTieredCache_GetOrLoad_SetFailureFailsOpen(t *testing.T) {
 	// Nothing listens on this port, so every redis call fails outright; a
 	// short deadline keeps the test fast regardless of environment.
-	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{"127.0.0.1:1"}})
 	defer client.Close() //nolint:errcheck // This is just a test file ffs
 
 	var gotErr error
@@ -270,7 +285,7 @@ func TestTieredCache_GetOrLoad_SetFailureFailsOpen(t *testing.T) {
 }
 
 func TestTieredCache_Invalidate_EvictsBothTiers(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "key"
 
@@ -291,22 +306,18 @@ func TestTieredCache_Invalidate_EvictsBothTiers(t *testing.T) {
 // local copy when the first instance overwrites the key with Set, not just
 // with Invalidate.
 func TestTieredCache_Set_PublishesInvalidation(t *testing.T) {
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("could not start miniredis: %v", err)
-	}
-	defer mr.Close()
+	addr := testRedisAddr(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	const key = "key"
 
-	writer := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	writer := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{addr}})
 	defer writer.Close() //nolint:errcheck // test cleanup
 	writerCache := NewTieredCache(writer, time.Minute, time.Minute)
 	defer writerCache.Close() //nolint:errcheck // test cleanup
 
-	reader := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	reader := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{addr}})
 	defer reader.Close() //nolint:errcheck // test cleanup
 	readerCache := NewTieredCache(reader, time.Minute, time.Minute)
 	defer readerCache.Close() //nolint:errcheck // test cleanup
@@ -343,7 +354,7 @@ func TestTieredCache_Set_PublishesInvalidation(t *testing.T) {
 // the instanceID tag in invalidationPayload, SubscribeInvalidations would
 // immediately evict the value Set just wrote locally.
 func TestTieredCache_Set_DoesNotSelfEvict(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "key"
 	tc.SubscribeInvalidations(ctx)
@@ -366,7 +377,7 @@ func TestTieredCache_Set_DoesNotSelfEvict(t *testing.T) {
 // own slice: mutating value after Set returns, the way reusing a
 // sync.Pool buffer would, must not reach the cached copy.
 func TestTieredCache_Set_CopiesValue(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "key"
 
@@ -394,7 +405,7 @@ func TestTieredCache_Set_CopiesValue(t *testing.T) {
 // local tier: mutating what Get returns must not corrupt the promoted
 // local copy a later Get serves.
 func TestTieredCache_Get_RedisHitPromotion_CopiesIntoLocal(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "key"
 
@@ -425,7 +436,7 @@ func TestTieredCache_Get_RedisHitPromotion_CopiesIntoLocal(t *testing.T) {
 // hand the caller the exact slice it just cached from the loader's
 // result: mutating the returned value must not corrupt what's now cached.
 func TestTieredCache_GetOrLoad_CopiesLoaderResult(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "key"
 
@@ -447,6 +458,40 @@ func TestTieredCache_GetOrLoad_CopiesLoaderResult(t *testing.T) {
 	}
 }
 
+// TestTieredCache_GetOrLoad_RecoversLoaderPanic proves a panicking loader
+// becomes a returned error instead of crashing the process: loader is
+// caller-supplied code running inside singleflight's shared call, and an
+// unrecovered panic there would take down every other key's in-flight
+// GetOrLoad too, not just this one.
+func TestTieredCache_GetOrLoad_RecoversLoaderPanic(t *testing.T) {
+	tc, _ := newTestTieredCache(t)
+	ctx := context.Background()
+
+	loader := func(context.Context) ([]byte, error) {
+		panic("boom") //nolint:forbidigo // deliberately panicking to test GetOrLoad recovers it
+	}
+
+	_, err := tc.GetOrLoad(ctx, "key", loader)
+	if err == nil {
+		t.Fatal("expected an error, the panic should have been recovered")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error = %q, want it to mention the panic value %q", err, "boom")
+	}
+
+	// The cache, and the TieredCache itself, must still work normally
+	// afterward: a recovered panic shouldn't leave anything corrupted.
+	val, err := tc.GetOrLoad(ctx, "key", func(context.Context) ([]byte, error) {
+		return []byte("value"), nil
+	})
+	if err != nil {
+		t.Fatalf("GetOrLoad after the panic: %v", err)
+	}
+	if string(val) != "value" {
+		t.Fatalf("GetOrLoad = %q, want %q", val, "value")
+	}
+}
+
 // TestTieredCache_GetOrLoad_SlowLoaderDoesNotOverwriteNewerSet reproduces
 // the race a slow loader can hit: GetOrLoad's loader is still running when
 // a concurrent Set for the same key completes with a fresher value. Once
@@ -454,7 +499,7 @@ func TestTieredCache_GetOrLoad_CopiesLoaderResult(t *testing.T) {
 // let it clobber what the concurrent Set already wrote, there would be
 // nothing left to correct it afterward. See setIfVersion's doc comment.
 func TestTieredCache_GetOrLoad_SlowLoaderDoesNotOverwriteNewerSet(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "key"
 
@@ -517,7 +562,7 @@ func TestTieredCache_GetOrLoad_SlowLoaderDoesNotOverwriteNewerSet(t *testing.T) 
 // still running. Invalidate bumps key's version counter specifically to
 // prevent this, see its doc comment.
 func TestTieredCache_GetOrLoad_SlowLoaderDoesNotResurrectInvalidatedKey(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "key"
 
@@ -578,7 +623,7 @@ func TestNewTieredCache_PanicsWhenBothTiersDisabled(t *testing.T) {
 }
 
 func TestTieredCache_WithoutLocalCache_BypassesLocalTier(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t, WithoutLocalCache())
+	tc, _ := newTestTieredCache(t, WithoutLocalCache())
 	ctx := context.Background()
 	const key = "key"
 
@@ -649,7 +694,7 @@ func (c prefixCodec) Decode(data []byte) ([]byte, error) {
 // {"name":"otmane"} has its own first colon seven bytes in, right after
 // "name".
 func TestTieredCache_Get_DoesNotCorruptValuesWithColons(t *testing.T) {
-	_, client := newMiniredisTieredCache(t)
+	_, client := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "key"
 	const legacy = `{"name":"otmane"}`
@@ -673,8 +718,27 @@ func TestTieredCache_Get_DoesNotCorruptValuesWithColons(t *testing.T) {
 	}
 }
 
+// TestVersionKey_SharesClusterHashTagWithValueKey proves versionKey's
+// Cluster hash tag wraps key exactly, nothing added or dropped: Cluster
+// hashes only the substring between the first '{' and '}' when present,
+// so this is what makes the version key land on the same slot as the
+// plain, unwrapped value key.
+func TestVersionKey_SharesClusterHashTagWithValueKey(t *testing.T) {
+	for _, key := range []string{"key", "user:1234", ""} {
+		vk := versionKey(key)
+		open := strings.IndexByte(vk, '{')
+		shut := strings.IndexByte(vk, '}')
+		if open < 0 || shut < 0 || shut < open {
+			t.Fatalf("versionKey(%q) = %q, missing a well-formed hash tag", key, vk)
+		}
+		if tag := vk[open+1 : shut]; tag != key {
+			t.Errorf("versionKey(%q) hash tag = %q, want %q", key, tag, key)
+		}
+	}
+}
+
 func TestTieredCache_Codec_RoundTrip(t *testing.T) {
-	tc, client := newMiniredisTieredCache(t, WithCodec(prefixCodec{marker: 0xAB}))
+	tc, client := newTestTieredCache(t, WithCodec(prefixCodec{marker: 0xAB}))
 	ctx := context.Background()
 	const key = "key"
 
@@ -718,7 +782,7 @@ func TestTieredCache_Codec_EncodeFailurePreventsWrite(t *testing.T) {
 	}
 
 	var gotErr error
-	tc, client := newMiniredisTieredCache(
+	tc, client := newTestTieredCache(
 		t,
 		WithCodec(failingCodec),
 		WithObserver(observerFunc{onEncodeError: func(err error) { gotErr = err }}),
@@ -740,7 +804,7 @@ func TestTieredCache_Codec_DecodeFailureIsAMiss(t *testing.T) {
 	// Start plain (no codec) so we can seed redis directly with data that
 	// won't decode, simulating e.g. entries written before a codec was
 	// introduced.
-	_, client := newMiniredisTieredCache(t)
+	_, client := newTestTieredCache(t)
 	ctx := context.Background()
 	const key = "key"
 
@@ -779,7 +843,7 @@ func (c codecFunc) Decode(data []byte) ([]byte, error)  { return c.decode(data) 
 // there.
 func TestTieredCache_Stats(t *testing.T) {
 	t.Run("local and redis hits and misses", func(t *testing.T) {
-		tc, _ := newMiniredisTieredCache(t)
+		tc, _ := newTestTieredCache(t)
 		ctx := context.Background()
 		const key = "key"
 
@@ -822,7 +886,7 @@ func TestTieredCache_Stats(t *testing.T) {
 	t.Run("redis error", func(t *testing.T) {
 		// Nothing listens on this port, so every redis call fails outright;
 		// a short deadline keeps the test fast regardless of environment.
-		client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+		client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{"127.0.0.1:1"}})
 		defer client.Close() //nolint:errcheck // test cleanup
 		tc := NewTieredCache(client, time.Minute, time.Minute)
 		defer tc.Close() //nolint:errcheck // test cleanup
@@ -845,7 +909,7 @@ func TestTieredCache_Stats(t *testing.T) {
 			encode: func([]byte) ([]byte, error) { return nil, boom },
 			decode: func(data []byte) ([]byte, error) { return data, nil },
 		}
-		tc, _ := newMiniredisTieredCache(t, WithCodec(failingCodec))
+		tc, _ := newTestTieredCache(t, WithCodec(failingCodec))
 		ctx := context.Background()
 
 		if err := tc.Set(ctx, "key", []byte("hello")); err == nil {
@@ -861,7 +925,7 @@ func TestTieredCache_Stats(t *testing.T) {
 		// Start plain (no codec) so redis can be seeded directly with data
 		// that won't decode, simulating e.g. entries written before a
 		// codec was introduced.
-		_, client := newMiniredisTieredCache(t)
+		_, client := newTestTieredCache(t)
 		ctx := context.Background()
 		const key = "key"
 
@@ -884,7 +948,7 @@ func TestTieredCache_Stats(t *testing.T) {
 	t.Run("set error inside GetOrLoad", func(t *testing.T) {
 		// Nothing listens on this port, so every redis call fails outright;
 		// a short deadline keeps the test fast regardless of environment.
-		client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+		client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{"127.0.0.1:1"}})
 		defer client.Close() //nolint:errcheck // test cleanup
 		tc := NewTieredCache(client, time.Minute, time.Minute)
 		defer tc.Close() //nolint:errcheck // test cleanup
@@ -929,7 +993,7 @@ func TestTieredCache_LatencyHistograms(t *testing.T) {
 		local := &fakeHistogram{}
 		redisHist := &fakeHistogram{}
 		pubsub := &fakeHistogram{}
-		tc, _ := newMiniredisTieredCache(
+		tc, _ := newTestTieredCache(
 			t,
 			WithLocalLatencyHistogram(local),
 			WithRedisLatencyHistogram(redisHist),
@@ -990,7 +1054,7 @@ func TestTieredCache_LatencyHistograms(t *testing.T) {
 	t.Run("nil histograms are left unset by default", func(t *testing.T) {
 		// No WithLocalLatencyHistogram / WithRedisLatencyHistogram: Get and
 		// Set must not panic on a nil Histogram.
-		tc, _ := newMiniredisTieredCache(t)
+		tc, _ := newTestTieredCache(t)
 		ctx := context.Background()
 
 		if err := tc.Set(ctx, "key", []byte("value")); err != nil {
@@ -1009,7 +1073,7 @@ func TestTieredCache_LatencyHistograms(t *testing.T) {
 // by an implementation that just never calls fn a second time regardless
 // of args.
 func TestWithCache_MemoizesFunction(t *testing.T) {
-	tc, _ := newMiniredisTieredCache(t)
+	tc, _ := newTestTieredCache(t)
 	ctx := context.Background()
 
 	calls := map[string]int{}

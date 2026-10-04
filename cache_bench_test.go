@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -18,31 +17,21 @@ var benchValue = []byte(`{"id":1234,"name":"otmane","email":"otmane@example.com"
 
 const benchTTL = time.Minute
 
-// newBenchRedisClient returns a *redis.Client to benchmark against.
-//
-// By default it spins up an in-process miniredis instance, so `go test -bench`
-// works with no external services. Point REDIS_ADDR at a real redis instance
-// (e.g. `REDIS_ADDR=localhost:6379 go test -bench .`) to get numbers that
-// include real network/IO overhead instead of a loopback fake.
-func newBenchRedisClient(b *testing.B) *redis.Client {
+// newBenchRedisClient returns a client backed by REDIS_ADDR to benchmark
+// against, e.g. `REDIS_ADDR=localhost:6379 go test -bench .`. Point it at
+// whatever redis instance you've already got running.
+func newBenchRedisClient(b *testing.B) redis.UniversalClient {
 	b.Helper()
 
-	if addr := os.Getenv("REDIS_ADDR"); addr != "" {
-		client := redis.NewClient(&redis.Options{Addr: addr})
-		if err := client.Ping(context.Background()).Err(); err != nil {
-			b.Fatalf("could not reach REDIS_ADDR=%s: %v", addr, err)
-		}
-		b.Cleanup(func() { _ = client.Close() })
-		return client
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		b.Fatal("REDIS_ADDR must be set to a reachable redis instance, e.g. REDIS_ADDR=localhost:6379")
 	}
 
-	mr, err := miniredis.Run()
-	if err != nil {
-		b.Fatalf("could not start miniredis: %v", err)
+	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{addr}})
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		b.Fatalf("could not reach REDIS_ADDR=%s: %v", addr, err)
 	}
-	b.Cleanup(mr.Close)
-
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	b.Cleanup(func() { _ = client.Close() })
 	return client
 }

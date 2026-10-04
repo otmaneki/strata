@@ -3,21 +3,29 @@ package strata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
 
-// newExampleRedisClient spins up an in-process miniredis instance so these
-// examples run with no external services.
-func newExampleRedisClient() (*redis.Client, error) {
-	mr, err := miniredis.Run()
-	if err != nil {
+// newExampleRedisClient returns a client backed by REDIS_ADDR, flushed
+// first so every example starts from an empty database (these run
+// sequentially, sharing one process). Point it at whatever redis
+// instance you've already got running, locally or in CI.
+func newExampleRedisClient() (redis.UniversalClient, error) {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		return nil, errors.New("REDIS_ADDR must be set to a reachable redis instance, e.g. REDIS_ADDR=localhost:6379")
+	}
+
+	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{addr}})
+	if err := client.FlushAll(context.Background()).Err(); err != nil {
 		return nil, err
 	}
-	return redis.NewClient(&redis.Options{Addr: mr.Addr()}), nil
+	return client, nil
 }
 
 func ExampleTieredCache_Set() {
@@ -95,7 +103,8 @@ func ExampleWithRedisLatencyHistogram() {
 
 	localLatency := &fakeHistogram{}
 	redisLatency := &fakeHistogram{}
-	tc := NewTieredCache(client, time.Minute, time.Minute,
+	tc := NewTieredCache(
+		client, time.Minute, time.Minute,
 		WithLocalLatencyHistogram(localLatency),
 		WithRedisLatencyHistogram(redisLatency),
 	)
@@ -128,7 +137,8 @@ func ExampleWithPubSubLatencyHistogram() {
 	defer client.Close() //nolint:errcheck // example cleanup
 
 	pubsubLatency := &fakeHistogram{}
-	tc := NewTieredCache(client, time.Minute, time.Minute,
+	tc := NewTieredCache(
+		client, time.Minute, time.Minute,
 		WithPubSubLatencyHistogram(pubsubLatency),
 	)
 	defer tc.Close() //nolint:errcheck // example cleanup
@@ -353,7 +363,8 @@ func ExampleWithCache() {
 	defer tc.Close() //nolint:errcheck // example cleanup
 
 	loaderCalls := 0
-	getUser := WithCache(tc, JSONMarshaler[exampleUser]{},
+	getUser := WithCache(
+		tc, JSONMarshaler[exampleUser]{},
 		func(id string) string { return "user:" + id },
 		func(_ context.Context, id string) (exampleUser, error) {
 			loaderCalls++
@@ -483,7 +494,7 @@ func (o exampleObserver) OnRedisError(err error) {
 // otherwise report only as a plain cache miss.
 func ExampleWithObserver() {
 	// Nothing listens on this port, so every call fails outright.
-	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{"127.0.0.1:1"}})
 	defer client.Close() //nolint:errcheck // example cleanup
 
 	var lastErr error

@@ -17,7 +17,11 @@ between minor versions; every such change is called out here.
   (`WithLocalCacheSize`), background TTL sweep
   (`WithLocalCacheEvictInterval`). Eviction is best-effort, not LRU, see
   "Known limitations".
-- `GetOrLoad` with singleflight dedup.
+- `GetOrLoad` with singleflight dedup. A caller's own context canceling
+  doesn't abort the shared loader call other waiters depend on; it runs
+  on a detached context bounded by `WithLoaderTimeout` (default 30s)
+  instead. A panicking loader is recovered and returned as an error, not
+  a process crash.
 - Generic `GetOrLoad[T]` and `WithCache`, with a pluggable `Marshaler[T]`
   (`JSONMarshaler[T]` default).
 - Cross-instance invalidation: `Invalidate`/`SubscribeInvalidations` over
@@ -47,7 +51,8 @@ between minor versions; every such change is called out here.
 
 - Values are stored under the caller's key exactly as given (after the
   `Codec`, if configured); nothing prepended or wrapped.
-- Each key has a version counter at `strata:ver:<key>`; reserved prefix.
+- Each key has a version counter at `strata:ver:{<key>}`, hash-tagged so
+  it shares a Cluster slot with the plain value key; reserved prefix.
 - Invalidations publish on `cache:invalidate` as `<instance-id>:<key>`.
 
 ### Known limitations
@@ -55,8 +60,11 @@ between minor versions; every such change is called out here.
 - Version counters never expire; redis memory grows with the number of
   distinct keys ever written. An `allkeys-*` eviction policy may evict
   them anyway.
-- Redis Cluster isn't supported: only `*redis.Client` is accepted, and a
-  value key and its version key may hash to different slots.
+- `NewTieredCache` accepts `redis.UniversalClient` (`*redis.Client`,
+  `*redis.ClusterClient`, or `*redis.Ring`). Against Cluster, the
+  version-counter key is hash-tagged to colocate with the value key's
+  slot, except when the caller's own key already contains a `{...}` hash
+  tag of its own, in which case colocation isn't guaranteed.
 - Pub/sub delivers at most once; invalidations published while a
   subscriber is disconnected are lost, local entries stay stale for up to
   `localTTL`.
