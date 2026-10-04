@@ -59,10 +59,15 @@ func RemoteTTL(d time.Duration) WriteOption {
 // struct first, rather than letting each one write straight through to a
 // duration, is what makes that independent of the order they arrive in,
 // TTL after LocalTTL resolves the same as TTL before it.
+//
+// Whatever it resolves to, the local TTL is capped by the remote one,
+// see capLocalTTL. That applies to the cache's own defaults too, not
+// just to opts: NewTieredCache accepts a localTTL longer than its
+// remoteTTL, and that combination has the same problem.
 func (tc *TieredCache) resolveTTLs(opts []WriteOption) (local, remote time.Duration) {
 	local, remote = tc.localTTL, tc.remoteTTL
 	if len(opts) == 0 {
-		return local, remote
+		return capLocalTTL(local, remote), remote
 	}
 
 	var o writeOptions
@@ -81,7 +86,43 @@ func (tc *TieredCache) resolveTTLs(opts []WriteOption) (local, remote time.Durat
 	if o.remoteTTL != nil {
 		remote = *o.remoteTTL
 	}
-	return local, remote
+	return capLocalTTL(local, remote), remote
+}
+
+// capLocalTTL holds the local tier to the remote tier's lifetime: a
+// cached copy must never outlive the value it was cached from.
+//
+// Nothing publishes an invalidation when a redis key merely expires, so
+// a local copy that outlives it keeps being served with no source of
+// truth left to correct it, and no event that would ever evict it early.
+// A remote TTL of 0 or less means the key never expires in redis, so
+// there's nothing to cap against.
+//
+// This is deliberately silent rather than an error: local > remote is
+// almost always a mistake, and the one arguably coherent reading of it,
+// "accept more staleness locally than redis keeps", is better expressed
+// by raising the remote TTL.
+func capLocalTTL(local, remote time.Duration) time.Duration {
+	if remote > 0 && local > remote {
+		return remote
+	}
+	return local
+}
+
+// ttlMilliseconds converts d into the whole milliseconds the Lua scripts
+// take as their expiry argument.
+//
+// It rounds up, so every positive duration stays positive. Truncating
+// turns anything under a millisecond into 0, which the scripts read as
+// "no expiry": asking for a 500µs lifetime and getting an immortal key
+// is the one direction a cache must never fail by accident. A
+// non-positive d still maps to 0, which is how RemoteTTL(0) asks for no
+// expiry on purpose.
+func ttlMilliseconds(d time.Duration) int64 {
+	if d <= 0 {
+		return 0
+	}
+	return int64((d + time.Millisecond - 1) / time.Millisecond)
 }
 
 // setLocal writes value into the local tier under the resolved per-write

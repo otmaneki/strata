@@ -38,6 +38,22 @@ func assertLocalTTL(t *testing.T, tc *TieredCache, key string, before time.Time,
 	}
 }
 
+// assertLocalTTLAtMost checks key expires locally within (0, ttl] from
+// now, rather than at a specific point.
+//
+// Promotion caps the local TTL at the key's *remaining* redis lifetime,
+// which has already decayed by the time the read happens, so the exact
+// bound assertLocalTTL uses doesn't hold: asking for a 10s cap and
+// getting 9.998s is correct behavior, not drift.
+func assertLocalTTLAtMost(t *testing.T, tc *TieredCache, key string, ttl time.Duration) {
+	t.Helper()
+
+	remaining := time.Until(localExpiry(t, tc, key))
+	if remaining <= 0 || remaining > ttl {
+		t.Fatalf("local entry for %s expires in %v, want within (0, %v]", key, remaining, ttl)
+	}
+}
+
 // assertRemoteTTL checks key's redis PTTL is in (0, ttl]. It can only
 // have shrunk since the write, never grown, so an upper bound of exactly
 // ttl is tight rather than flaky.
@@ -110,10 +126,33 @@ func TestResolveTTLs(t *testing.T) {
 			wantRem:   30 * time.Minute,
 		},
 		{
+			// The default local TTL (1m) outlives the resolved remote
+			// one (1s) here, so the cap pulls it down to 1s.
 			name:      "last option of the same kind wins",
 			opts:      []WriteOption{RemoteTTL(time.Hour), RemoteTTL(time.Second)},
-			wantLocal: defaultLocal,
+			wantLocal: time.Second,
 			wantRem:   time.Second,
+		},
+		{
+			name:      "local is capped to remote",
+			opts:      []WriteOption{LocalTTL(time.Hour), RemoteTTL(time.Minute)},
+			wantLocal: time.Minute,
+			wantRem:   time.Minute,
+		},
+		{
+			// Equal is not greater: nothing to cap.
+			name:      "local equal to remote is untouched",
+			opts:      []WriteOption{TTL(time.Hour)},
+			wantLocal: time.Hour,
+			wantRem:   time.Hour,
+		},
+		{
+			// A non-positive remote TTL means the key never expires in
+			// redis, so there's no remote lifetime to cap against.
+			name:      "no cap when remote never expires",
+			opts:      []WriteOption{LocalTTL(time.Hour), RemoteTTL(0)},
+			wantLocal: time.Hour,
+			wantRem:   0,
 		},
 		{
 			// Zero is a real choice, not "unset": it must survive
@@ -149,6 +188,144 @@ func TestResolveTTLs(t *testing.T) {
 	if tc.localTTL != defaultLocal || tc.remoteTTL != defaultRemote {
 		t.Fatalf("defaults mutated: localTTL=%v remoteTTL=%v", tc.localTTL, tc.remoteTTL)
 	}
+}
+
+// TestResolveTTLs_CapsConfiguredDefaults covers the cap applying to
+// NewTieredCache's own TTLs, not just to WriteOptions: the constructor
+// accepts a localTTL longer than its remoteTTL, and that pairing strands
+// a local copy exactly the same way.
+func TestResolveTTLs_CapsConfiguredDefaults(t *testing.T) {
+	tc := &TieredCache{localTTL: 5 * time.Minute, remoteTTL: 30 * time.Second}
+
+	local, remote := tc.resolveTTLs(nil)
+	if local != 30*time.Second {
+		t.Errorf("local TTL = %v, want it capped to the 30s remote TTL", local)
+	}
+	if remote != 30*time.Second {
+		t.Errorf("remote TTL = %v, want 30s", remote)
+	}
+}
+
+func TestTTLMilliseconds(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Duration
+		want int64
+	}{
+		{"whole milliseconds are exact", 1500 * time.Millisecond, 1500},
+		{"exactly one millisecond", time.Millisecond, 1},
+		// The regression this rounding exists for: truncation sent any
+		// sub-millisecond TTL to 0, which the Lua scripts read as "no
+		// expiry". Asking for 500µs and getting an immortal key is the
+		// worst direction to be wrong in.
+		{"sub-millisecond rounds up, never to zero", 500 * time.Microsecond, 1},
+		{"one nanosecond rounds up", time.Nanosecond, 1},
+		{"fractional milliseconds round up", 1500 * time.Microsecond, 2},
+		// Zero and below keep meaning "no expiry", deliberately.
+		{"zero stays zero", 0, 0},
+		{"negative stays zero", -time.Second, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ttlMilliseconds(tt.in); got != tt.want {
+				t.Errorf("ttlMilliseconds(%v) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTieredCache_PromotionTTL(t *testing.T) {
+	tc := &TieredCache{localTTL: time.Minute}
+
+	tests := []struct {
+		name string
+		pttl time.Duration
+		err  error
+		want time.Duration
+	}{
+		{"shorter remote lifetime caps the promotion", 10 * time.Second, nil, 10 * time.Second},
+		{"longer remote lifetime leaves localTTL alone", time.Hour, nil, time.Minute},
+		// go-redis reports PTTL's -1/-2 sentinels as raw durations, not
+		// scaled by its millisecond precision.
+		{"no expiry leaves localTTL alone", -1, nil, time.Minute},
+		{"already gone means do not promote", -2, nil, 0},
+		{"a PTTL error falls back to localTTL", 0, errors.New("boom"), time.Minute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tc.promotionTTL(tt.pttl, tt.err); got != tt.want {
+				t.Errorf("promotionTTL(%v, %v) = %v, want %v", tt.pttl, tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTieredCache_Set_CapsLocalTTLToRemote(t *testing.T) {
+	tc, client := newTestTieredCache(t) // both tiers default to a minute
+	ctx := context.Background()
+
+	// Asking for an hour locally against a 10s remote lifetime: the
+	// local copy would otherwise outlive redis by 59 minutes, with
+	// nothing left to correct or evict it.
+	before := time.Now()
+	if err := tc.Set(ctx, "otp:123", []byte("424242"), LocalTTL(time.Hour), RemoteTTL(10*time.Second)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	assertLocalTTL(t, tc, "otp:123", before, 10*time.Second)
+	assertRemoteTTL(t, client, "otp:123", 10*time.Second)
+}
+
+// TestTieredCache_Get_PromotionRespectsRemainingRemoteTTL is the
+// cross-node half of the same guarantee. A per-write RemoteTTL exists
+// only in the writer's call, so a reader has to recover it from the key's
+// own remaining lifetime or it will cache the value for its full default
+// localTTL.
+func TestTieredCache_Get_PromotionRespectsRemainingRemoteTTL(t *testing.T) {
+	tc, _ := newTestTieredCache(t) // localTTL default: one minute
+	ctx := context.Background()
+
+	if err := tc.Set(ctx, "otp:456", []byte("131313"), RemoteTTL(10*time.Second)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// Drop the local copy so the next Get has to come back through
+	// redis, which is the path another node would take.
+	tc.local.Delete("otp:456")
+
+	val, ok := tc.Get(ctx, "otp:456")
+	if !ok {
+		t.Fatal("expected a redis hit")
+	}
+	if string(val) != "131313" {
+		t.Fatalf("Get = %q, want %q", val, "131313")
+	}
+
+	// Promoted for whatever redis has left, at most the 10s it was
+	// written with, rather than the 1m default localTTL.
+	assertLocalTTLAtMost(t, tc, "otp:456", 10*time.Second)
+}
+
+// TestTieredCache_Get_PromotionKeepsLocalTTLForNonExpiringKeys guards the
+// other side of promotionTTL: a key with no expiry must not be promoted
+// for a negative or zero duration just because PTTL returned -1.
+func TestTieredCache_Get_PromotionKeepsLocalTTLForNonExpiringKeys(t *testing.T) {
+	tc, _ := newTestTieredCache(t)
+	ctx := context.Background()
+
+	if err := tc.Set(ctx, "forever", []byte("value"), RemoteTTL(0)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	tc.local.Delete("forever")
+
+	before := time.Now()
+	if _, ok := tc.Get(ctx, "forever"); !ok {
+		t.Fatal("expected a redis hit")
+	}
+
+	assertLocalTTL(t, tc, "forever", before, time.Minute)
 }
 
 func TestTieredCache_Set_NoOptionsUsesConfiguredTTLs(t *testing.T) {

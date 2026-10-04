@@ -118,7 +118,7 @@ func (tc *TieredCache) setIfVersion(
 		toStore = encoded
 	}
 
-	ttlMillis := int64(remoteTTL / time.Millisecond)
+	ttlMillis := ttlMilliseconds(remoteTTL)
 	redisStart := tc.startRedisTimer()
 	res, err := casScript.Run(ctx, tc.redis, []string{key, versionKey(key)}, toStore, expectedVersion, ttlMillis).Result()
 	tc.observeRedisLatency(redisStart)

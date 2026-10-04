@@ -1,7 +1,6 @@
 package strata
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +14,39 @@ import (
 // so SubscribeInvalidations can skip the instance's own publishes.
 func (tc *TieredCache) invalidationPayload(key string) string {
 	return tc.instanceID + ":" + key
+}
+
+// promotionTTL is how long a redis hit should be kept in the local tier:
+// the cache's configured localTTL, capped by whatever lifetime the key
+// has left in redis.
+//
+// The cap is what makes a per-write RemoteTTL mean anything on a node
+// that didn't perform the write. Per-write TTLs live only in the writer's
+// call, so without this a key written with RemoteTTL(30*time.Second)
+// would be promoted for the full default localTTL by every node that
+// reads it, outliving the redis copy it came from. Nothing publishes an
+// invalidation when a key merely expires, so that stale local copy would
+// have no source of truth left to correct it.
+//
+// pttl is redis's PTTL reply as go-redis reports it: -1 for a key with no
+// expiry, and so nothing to cap against, -2 for one that's already gone.
+// An error reading it falls back to the configured localTTL, which is the
+// behavior this had before the cap existed.
+func (tc *TieredCache) promotionTTL(pttl time.Duration, err error) time.Duration {
+	switch {
+	case err != nil:
+		return tc.localTTL
+	case pttl == -2:
+		// Expired between the GET and the PTTL. The value is still
+		// returned to the caller, it was real when GET ran, but caching
+		// it now would outlive redis by the whole localTTL. A
+		// non-positive TTL makes setLocal drop the key instead.
+		return 0
+	case pttl > 0 && pttl < tc.localTTL:
+		return pttl
+	default:
+		return tc.localTTL
+	}
 }
 
 // Get checks the local tier first, then redis, promoting a redis hit
@@ -42,9 +74,19 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 		return nil, false
 	}
 
+	// GET and PTTL together, pipelined into one round trip: the promotion
+	// below needs the key's remaining lifetime to avoid caching it
+	// locally for longer than redis will keep it. See promotionTTL.
 	redisStart := tc.startRedisTimer()
-	val, err := tc.redis.Get(ctx, key).Bytes()
+	pipe := tc.redis.Pipeline()
+	getCmd := pipe.Get(ctx, key)
+	pttlCmd := pipe.PTTL(ctx, key)
+	// Exec's own error is just the first command's, redis.Nil on a plain
+	// miss included, so the commands are inspected individually instead.
+	_, _ = pipe.Exec(ctx)
 	tc.observeRedisLatency(redisStart)
+
+	val, err := getCmd.Bytes()
 	switch {
 	case err == nil:
 		tc.stats.redisHits.Add(1)
@@ -60,13 +102,10 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 			}
 		}
 
-		if tc.localEnabled {
-			// Copy before storing: decoded is also returned below, and
-			// a caller mutating it mustn't reach into the local tier.
-			localStart := tc.startLocalTimer()
-			tc.local.Set(key, bytes.Clone(decoded), tc.localTTL)
-			tc.observeLocalLatency(localStart)
-		}
+		// setLocal copies decoded before storing it: decoded is also
+		// returned below, and a caller mutating it mustn't reach into
+		// the local tier.
+		tc.setLocal(key, decoded, tc.promotionTTL(pttlCmd.Result()))
 		return decoded, true
 	case errors.Is(err, redis.Nil):
 		tc.stats.redisMisses.Add(1)
@@ -113,7 +152,7 @@ func (tc *TieredCache) Set(ctx context.Context, key string, value []byte, opts .
 		toStore = encoded
 	}
 
-	ttlMillis := int64(remoteTTL / time.Millisecond)
+	ttlMillis := ttlMilliseconds(remoteTTL)
 	redisStart := tc.startRedisTimer()
 	err := setScript.Run(ctx, tc.redis, []string{key, versionKey(key)}, toStore, ttlMillis).Err()
 	tc.observeRedisLatency(redisStart)
