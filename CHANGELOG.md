@@ -45,6 +45,23 @@ between minor versions; every such change is called out here.
   via `WithLocalLatencyHistogram`, `WithRedisLatencyHistogram`,
   `WithPubSubLatencyHistogram`.
 - `Reader`, `Writer`, `ReadWriter`, `Loader`, `Invalidator`, `Cache`.
+- Per-write TTL overrides via a new `WriteOption` type, accepted as a
+  variadic tail by `Set`, `GetOrLoad`, `GetOrLoad[T]`, and `WithCache`.
+  `NewTieredCache`'s TTLs become defaults rather than the only setting:
+  - `TTL(d)` sets both tiers; `LocalTTL(d)` and `RemoteTTL(d)` override
+    it for their own tier regardless of the order options are passed in
+    (they're collected into a struct and resolved together, not applied
+    one after another).
+  - `RemoteTTL(0)` (or any non-positive duration) writes to redis with
+    no expiry, matching what `NewTieredCache` already did with a
+    non-positive `remoteTTL`.
+  - `LocalTTL(0)` keeps the key out of the local tier for that write and
+    deletes any entry already cached under it, rather than storing one
+    that's expired on arrival. Previously a non-positive local TTL stored
+    a dead entry that every read then had to expire and discard.
+  - On `GetOrLoad`, options configure the write that fills a miss. Since
+    concurrent misses share one loader call, they share one write:
+    whoever wins the singleflight race sets the TTLs for all of them.
 - MIT license.
 
 ### Redis data layout
@@ -75,11 +92,19 @@ between minor versions; every such change is called out here.
   atomic under concurrent writers.
 - `GetOrLoad` costs one extra redis round trip per miss, to read the
   key's version before running the loader.
+- `WriteOption`s passed to `GetOrLoad` apply to whichever concurrent
+  caller wins the singleflight race, since the others share its single
+  write. Pass the same options at every call site for a key, or fix them
+  once with `WithCache`.
 
 ### Notes for anyone tracking `main` before this release
 
 - Commit `38add6c` briefly stored values as `<nanoseconds>:<data>`.
   Values written by that commit read back with the prefix still
   attached; flush them or let them expire before upgrading.
+- `Writer.Set` and `Loader.GetOrLoad` gained a variadic
+  `...WriteOption`. Call sites are unaffected, but your own
+  implementations of those interfaces need the parameter added to their
+  signatures.
 
 [Unreleased]: https://github.com/otmaneki/strata/commits/main

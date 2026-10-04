@@ -17,7 +17,10 @@ import (
 // retried as a miss: the bytes came from c.GetOrLoad succeeding, so
 // they're exactly what was last stored under key, and the loader would
 // just hit the same bytes again.
-func GetOrLoad[T any](ctx context.Context, c Cache, m Marshaler[T], key string, loader func(context.Context) (T, error)) (T, error) {
+//
+// opts are passed straight through to c.GetOrLoad, so they override the
+// TTLs of the write that caches a miss; see TTL, LocalTTL, RemoteTTL.
+func GetOrLoad[T any](ctx context.Context, c Cache, m Marshaler[T], key string, loader func(context.Context) (T, error), opts ...WriteOption) (T, error) {
 	var zero T
 
 	raw, err := c.GetOrLoad(ctx, key, func(ctx context.Context) ([]byte, error) {
@@ -26,7 +29,7 @@ func GetOrLoad[T any](ctx context.Context, c Cache, m Marshaler[T], key string, 
 			return nil, err
 		}
 		return m.Marshal(v)
-	})
+	}, opts...)
 	if err != nil {
 		return zero, err
 	}
@@ -49,10 +52,17 @@ func GetOrLoad[T any](ctx context.Context, c Cache, m Marshaler[T], key string, 
 //	    func(ctx context.Context, id string) (User, error) { return db.GetUser(ctx, id) },
 //	)
 //	user, err := getUser(ctx, "1234")
-func WithCache[Args, T any](c Cache, m Marshaler[T], keyFn func(Args) string, fn func(context.Context, Args) (T, error)) func(context.Context, Args) (T, error) {
+//
+// opts are fixed at wrap time and apply to every write the returned
+// function makes, which suits the usual case of one TTL policy per
+// memoized function:
+//
+//	getCountries := strata.WithCache(tc, m, keyFn, fetchCountries,
+//	    strata.RemoteTTL(7*24*time.Hour))
+func WithCache[Args, T any](c Cache, m Marshaler[T], keyFn func(Args) string, fn func(context.Context, Args) (T, error), opts ...WriteOption) func(context.Context, Args) (T, error) {
 	return func(ctx context.Context, args Args) (T, error) {
 		return GetOrLoad(ctx, c, m, keyFn(args), func(ctx context.Context) (T, error) {
 			return fn(ctx, args)
-		})
+		}, opts...)
 	}
 }

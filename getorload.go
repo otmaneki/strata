@@ -10,7 +10,19 @@ import (
 // setIfVersion can later tell whether a concurrent write landed while the
 // (possibly slow) loader was still running and if so drop the loader's
 // now-stale result instead of caching it.
-func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ctx context.Context) ([]byte, error)) ([]byte, error) {
+//
+// opts override the TTLs of the write that caches the loader's result,
+// the same way they do for Set:
+//
+//	countries, err := tc.GetOrLoad(ctx, "config:countries", loadCountries,
+//	    strata.RemoteTTL(7*24*time.Hour))
+//
+// Since concurrent misses for one key share a single loader call, they
+// also share that one write: callers that lose the race to it get the
+// winner's TTLs, not their own. Pass the same opts at every call site
+// for a given key, or treat them as a property of the key rather than of
+// the call.
+func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ctx context.Context) ([]byte, error), opts ...WriteOption) ([]byte, error) {
 	if val, ok := tc.Get(ctx, key); ok {
 		return val, nil
 	}
@@ -54,7 +66,7 @@ func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ct
 		case !tc.remoteEnabled:
 			// No concurrent redis writer to race against, so Set's plain
 			// last-write-wins is fine.
-			if err := tc.Set(detachedCtx, key, val); err != nil {
+			if err := tc.Set(detachedCtx, key, val, opts...); err != nil {
 				tc.stats.setErrors.Add(1)
 				tc.observer.OnSetError(fmt.Errorf("set key %s: %w", key, err))
 			}
@@ -62,7 +74,8 @@ func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ct
 			tc.stats.setErrors.Add(1)
 			tc.observer.OnSetError(fmt.Errorf("read version for key %s: %w", key, versionErr))
 		default:
-			switch applied, err := tc.setIfVersion(detachedCtx, key, val, expectedVersion); {
+			localTTL, remoteTTL := tc.resolveTTLs(opts)
+			switch applied, err := tc.setIfVersion(detachedCtx, key, val, expectedVersion, localTTL, remoteTTL); {
 			case err != nil:
 				tc.stats.setErrors.Add(1)
 				tc.observer.OnSetError(fmt.Errorf("set key %s: %w", key, err))

@@ -28,6 +28,10 @@ promotion/invalidation logic yourself.
 
 - **Two tiers, one API.** `Get`/`Set` transparently check local first, fall
   back to redis, and promote redis hits into the local tier.
+- **Per-write TTLs, per tier.** The cache's two TTLs are defaults, not a
+  ceiling: `TTL`, `LocalTTL`, and `RemoteTTL` override either tier for a
+  single `Set` or `GetOrLoad`, so a week-long config blob and a
+  30-minute session can share one cache. See "Per-write TTLs".
 - **Safe to reuse your buffers.** `Set`, and the `[]byte` a `GetOrLoad`
   loader returns, are always copied before they're cached, so a buffer
   pulled from e.g. a `sync.Pool` is safe to reuse the moment the call
@@ -103,6 +107,49 @@ if err := tc.Set(ctx, "greeting", []byte("hello")); err != nil {
 
 val, ok := tc.Get(ctx, "greeting")
 ```
+
+### Per-write TTLs
+
+`NewTieredCache`'s two TTLs are the defaults, not the only option. Any
+single write can override either tier:
+
+```go
+tc.Set(ctx, "session:abc", data)                        // both defaults
+
+// Long-lived in redis, still only cached locally for the default TTL, so
+// a change propagates in seconds rather than a week.
+tc.Set(ctx, "config:countries", data, strata.RemoteTTL(7*24*time.Hour))
+
+// Both tiers at once, with the local one tightened.
+tc.Set(ctx, "session:abc", data, strata.TTL(30*time.Minute), strata.LocalTTL(time.Minute))
+```
+
+`TTL` sets both tiers; `LocalTTL` and `RemoteTTL` override it for their
+own tier **in whichever order you pass them**, so the two options above
+can be swapped with no change in meaning.
+
+Non-positive durations are meaningful rather than ignored:
+
+- `RemoteTTL(0)` writes the key to redis with no expiry at all. It stays
+  until something overwrites or invalidates it.
+- `LocalTTL(0)` keeps the key out of the local tier for this write, and
+  deletes whatever was cached under it, since that copy is stale the
+  moment the write lands. Reads then go to redis for that one key, the
+  per-write counterpart to `WithoutLocalCache`.
+
+The same options apply to `GetOrLoad` and the typed helpers, where they
+configure the write that populates a miss:
+
+```go
+countries, err := tc.GetOrLoad(ctx, "config:countries", loadCountries,
+    strata.RemoteTTL(7*24*time.Hour))
+```
+
+One caveat there: concurrent misses for a key share a single loader call
+and therefore a single write, so callers that lose that race get the
+winner's TTLs. Pass the same options at every call site for a given key,
+or treat the TTL as a property of the key rather than of the call, e.g.
+by fixing it once with `WithCache`.
 
 ### Cache-aside with GetOrLoad
 
@@ -205,7 +252,11 @@ More runnable examples for every option live in `example_test.go`.
   to redis and bumps the key's version counter via a small Lua script
   (`setScript`), then publishes an invalidation, the same one `Invalidate`
   sends, so other instances drop their now-stale copy instead of serving
-  it until `localTTL` expires. If a `Codec` is configured, only the redis
+  it until `localTTL` expires. Each tier's TTL comes from the cache's
+  defaults unless a `WriteOption` overrides it for this one call; the
+  options are collected into a struct and resolved together, which is
+  what makes `LocalTTL` beat `TTL` regardless of the order they're
+  passed in. If a `Codec` is configured, only the redis
   copy is transformed, the local tier always holds the original value, so
   a warm local read never pays an encode/decode cost. The value redis
   stores under the key is always exactly what was given to `Set`, nothing

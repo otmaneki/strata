@@ -515,3 +515,108 @@ func ExampleWithObserver() {
 	// hit: false
 	// error observed: true
 }
+
+// ExampleRemoteTTL shows overriding a single write's TTLs per tier. The
+// cache's own TTLs, the two passed to NewTieredCache, are defaults; a
+// rarely-changing config blob can outlive them in redis while still
+// being cached locally only briefly, so an update still propagates in
+// seconds rather than days.
+func ExampleRemoteTTL() {
+	client, err := newExampleRedisClient()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer client.Close() //nolint:errcheck // example cleanup
+
+	tc := NewTieredCache(client, time.Minute, time.Minute)
+	defer tc.Close() //nolint:errcheck // example cleanup
+
+	ctx := context.Background()
+	if err := tc.Set(ctx, "config:countries", []byte(`["ma","fr"]`), RemoteTTL(7*24*time.Hour)); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	ttl, err := client.TTL(ctx, "config:countries").Result()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("redis TTL over a day:", ttl > 24*time.Hour)
+
+	val, ok := tc.Get(ctx, "config:countries")
+	fmt.Println(string(val), ok)
+
+	// Output:
+	// redis TTL over a day: true
+	// ["ma","fr"] true
+}
+
+// ExampleTTL shows TTL setting both tiers at once, with LocalTTL
+// tightening just the local one. The two options are order-independent:
+// a tier-specific option always wins over TTL for its own tier.
+func ExampleTTL() {
+	client, err := newExampleRedisClient()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer client.Close() //nolint:errcheck // example cleanup
+
+	tc := NewTieredCache(client, time.Hour, time.Hour)
+	defer tc.Close() //nolint:errcheck // example cleanup
+
+	ctx := context.Background()
+	err = tc.Set(ctx, "session:abc", []byte("session-data"), TTL(30*time.Minute), LocalTTL(time.Minute))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	ttl, err := client.TTL(ctx, "session:abc").Result()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("redis TTL at most 30m:", ttl > 0 && ttl <= 30*time.Minute)
+
+	// Output:
+	// redis TTL at most 30m: true
+}
+
+// ExampleLocalTTL shows a non-positive local TTL keeping one key out of
+// the local tier, the per-write counterpart to WithoutLocalCache. Any
+// copy already cached under the key is dropped, so no reader can be
+// served the value this write just replaced.
+func ExampleLocalTTL() {
+	client, err := newExampleRedisClient()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer client.Close() //nolint:errcheck // example cleanup
+
+	tc := NewTieredCache(client, time.Minute, time.Minute)
+	defer tc.Close() //nolint:errcheck // example cleanup
+
+	ctx := context.Background()
+	if err := tc.Set(ctx, "rate:limit", []byte("stale")); err != nil {
+		fmt.Println(err)
+		return
+	}
+	if err := tc.Set(ctx, "rate:limit", []byte("fresh"), LocalTTL(0)); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	_, cachedLocally := tc.local.Get("rate:limit")
+	fmt.Println("held locally:", cachedLocally)
+
+	val, ok := tc.Get(ctx, "rate:limit")
+	fmt.Println(string(val), ok)
+
+	// Output:
+	// held locally: false
+	// fresh true
+}

@@ -19,7 +19,11 @@ type Writer interface {
 	// Set writes value under key. Whether value is copied or retained is
 	// implementation-defined, check the concrete type before reusing or
 	// mutating it afterward.
-	Set(ctx context.Context, key string, value []byte) error
+	//
+	// opts override this one write's TTLs; see TTL, LocalTTL, RemoteTTL.
+	// An implementation with nothing resembling a tier to apply them to
+	// may ignore them, so don't rely on them for correctness.
+	Set(ctx context.Context, key string, value []byte, opts ...WriteOption) error
 }
 
 // ReadWriter is Reader and Writer combined, the shape most request-path
@@ -43,7 +47,11 @@ type Loader interface {
 	//	    }
 	//	    return json.Marshal(u)
 	//	})
-	GetOrLoad(ctx context.Context, key string, loader func(ctx context.Context) ([]byte, error)) ([]byte, error)
+	//
+	// opts apply to the write that populates the miss, exactly as they do
+	// for Set; they never affect a hit, which was written under whatever
+	// TTLs the call that stored it asked for.
+	GetOrLoad(ctx context.Context, key string, loader func(ctx context.Context) ([]byte, error), opts ...WriteOption) ([]byte, error)
 }
 
 // Invalidator is the cross-instance side of Cache: removing a key and

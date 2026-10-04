@@ -1,7 +1,6 @@
 package strata
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -98,7 +97,16 @@ func (tc *TieredCache) currentVersion(ctx context.Context, key string) (int64, e
 // Otherwise a concurrent write already landed, and applying the loader's
 // now-stale result would leave redis wrong with nothing left to correct
 // it. A rejected write touches neither the local tier nor pub/sub.
-func (tc *TieredCache) setIfVersion(ctx context.Context, key string, value []byte, expectedVersion int64) (applied bool, err error) {
+//
+// localTTL and remoteTTL come already resolved from resolveTTLs, so this
+// never consults the cache's own defaults.
+func (tc *TieredCache) setIfVersion(
+	ctx context.Context,
+	key string,
+	value []byte,
+	expectedVersion int64,
+	localTTL, remoteTTL time.Duration,
+) (applied bool, err error) {
 	toStore := value
 	if tc.codec != nil {
 		encoded, err := tc.codec.Encode(value)
@@ -110,7 +118,7 @@ func (tc *TieredCache) setIfVersion(ctx context.Context, key string, value []byt
 		toStore = encoded
 	}
 
-	ttlMillis := int64(tc.remoteTTL / time.Millisecond)
+	ttlMillis := int64(remoteTTL / time.Millisecond)
 	redisStart := tc.startRedisTimer()
 	res, err := casScript.Run(ctx, tc.redis, []string{key, versionKey(key)}, toStore, expectedVersion, ttlMillis).Result()
 	tc.observeRedisLatency(redisStart)
@@ -127,11 +135,7 @@ func (tc *TieredCache) setIfVersion(ctx context.Context, key string, value []byt
 		return false, nil
 	}
 
-	if tc.localEnabled {
-		localStart := tc.startLocalTimer()
-		tc.local.Set(key, bytes.Clone(value), tc.localTTL)
-		tc.observeLocalLatency(localStart)
-	}
+	tc.setLocal(key, value, localTTL)
 
 	pubStart := tc.startPubSubTimer()
 	pubErr := tc.redis.Publish(ctx, invalidationPubSubChannel, tc.invalidationPayload(key)).Err()

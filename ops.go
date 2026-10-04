@@ -85,12 +85,18 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 // publishes an invalidation so other instances drop their stale local
 // copy. It always applies, unconditionally; see setIfVersion for the
 // conditional write GetOrLoad needs instead.
-func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error {
-	if tc.localEnabled {
-		localStart := tc.startLocalTimer()
-		tc.local.Set(key, bytes.Clone(value), tc.localTTL)
-		tc.observeLocalLatency(localStart)
-	}
+//
+// Both tiers use the TTLs NewTieredCache was given unless opts override
+// them for this one write:
+//
+//	tc.Set(ctx, "session:abc", data)                              // both defaults
+//	tc.Set(ctx, "config:countries", data, strata.RemoteTTL(7*24*time.Hour))
+//	tc.Set(ctx, "session:abc", data, strata.TTL(30*time.Minute), strata.LocalTTL(time.Minute))
+//
+// See TTL, LocalTTL, and RemoteTTL.
+func (tc *TieredCache) Set(ctx context.Context, key string, value []byte, opts ...WriteOption) error {
+	localTTL, remoteTTL := tc.resolveTTLs(opts)
+	tc.setLocal(key, value, localTTL)
 
 	if !tc.remoteEnabled {
 		return nil
@@ -107,7 +113,7 @@ func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error 
 		toStore = encoded
 	}
 
-	ttlMillis := int64(tc.remoteTTL / time.Millisecond)
+	ttlMillis := int64(remoteTTL / time.Millisecond)
 	redisStart := tc.startRedisTimer()
 	err := setScript.Run(ctx, tc.redis, []string{key, versionKey(key)}, toStore, ttlMillis).Err()
 	tc.observeRedisLatency(redisStart)
