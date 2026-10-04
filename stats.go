@@ -38,8 +38,8 @@ type Stats struct {
 	// StaleWritesDropped counts GetOrLoad discarding a loader's result
 	// instead of caching it, because a newer write for the same key
 	// landed in redis while the loader was still running. See
-	// setIfNewer's doc comment. The loader's result is still returned to
-	// its caller either way, only the cache write is skipped.
+	// setIfVersion's doc comment. The loader's result is still returned
+	// to its caller either way, only the cache write is skipped.
 	StaleWritesDropped uint64
 }
 

@@ -41,9 +41,12 @@ promotion/invalidation logic yourself.
   collapse into a single loader call. Everyone else waits and shares the
   result, instead of a thundering herd hitting your database.
 - **Safe against slow loaders.** A loader that's still running when a
-  newer `Set` for the same key completes won't clobber it with a stale
-  result once it finally returns, every redis write is versioned and a
-  stale one is dropped instead of applied. See `GetOrLoad` below.
+  newer `Set`, `Invalidate`, or another `GetOrLoad` for the same key
+  completes won't clobber it with a stale result once it finally
+  returns. Every key has a version counter redis itself owns and
+  increments on every write, immune to clock skew between instances; a
+  write that's no longer current is dropped instead of applied. See
+  `GetOrLoad` below.
 - **Generic, typed helpers.** `GetOrLoad[T]` and `WithCache` marshal/
   unmarshal a `T` for you (JSON by default, pluggable via `Marshaler`), so
   call sites stop hand-rolling `json.Marshal`/`Unmarshal` around every
@@ -198,28 +201,39 @@ More runnable examples for every option live in `example_test.go`.
   genuine miss is reported to the `Observer`, not the caller. `Get` fails
   open and looks like a miss either way, since that's the safer default for
   a cache.
-- **`Set`** writes to the local tier immediately and to redis, then
-  publishes an invalidation, the same one `Invalidate` sends, so other
-  instances drop their now-stale copy instead of serving it until
-  `localTTL` expires. If a `Codec` is configured, only the redis copy is
-  transformed, the local tier always holds the original value, so a warm
-  local read never pays an encode/decode cost.
-- **`Invalidate`** deletes locally, deletes in redis, then publishes the key
-  on a pub/sub channel. Every instance that called `SubscribeInvalidations`
+- **`Set`** writes to the local tier immediately, then atomically writes
+  to redis and bumps the key's version counter via a small Lua script
+  (`setScript`), then publishes an invalidation, the same one `Invalidate`
+  sends, so other instances drop their now-stale copy instead of serving
+  it until `localTTL` expires. If a `Codec` is configured, only the redis
+  copy is transformed, the local tier always holds the original value, so
+  a warm local read never pays an encode/decode cost. The value redis
+  stores under the key is always exactly what was given to `Set`, nothing
+  prepended or wrapped around it; the version lives in a separate,
+  `strata:ver:`-prefixed key redis owns.
+- **`Invalidate`** deletes locally, then atomically deletes the redis key
+  and bumps its version counter (`delScript`), then publishes the key on
+  a pub/sub channel. Every instance that called `SubscribeInvalidations`
   evicts that key from its own local tier when the message arrives. Every
   published message is tagged with the publishing instance's own id, so an
   instance that's subscribed to its own invalidations, the normal case when
   every instance both reads and writes, doesn't undo its own `Set`.
+  Bumping the version on delete, not just removing the value, matters: a
+  `GetOrLoad` loader already in flight for this key must see that
+  something changed and refuse to resurrect it.
 - **`GetOrLoad`** wraps `Get`, a `singleflight.Group`, and a version-aware
   write: on a miss, only one goroutine per key runs the loader; everyone
   else waits for it and shares the result. A loader can be slow, and if a
-  plain `Set` for the same key lands in redis while it's still running,
-  writing the loader's now-stale result afterward would silently corrupt
-  redis with nothing left to correct it. Every redis write is tagged with
-  a version, the time the write was decided, so GetOrLoad's write only
-  applies if it's still newer than whatever's already stored; otherwise
-  it's dropped (counted in `Stats().StaleWritesDropped`) and the fresher
-  value is left alone. The loader's result is still returned to its own
+  `Set`, `Invalidate`, or another `GetOrLoad` for the same key completes
+  while it's still running, writing the loader's now-stale result
+  afterward would silently corrupt redis with nothing left to correct it.
+  Before running the loader, `GetOrLoad` reads the key's current version;
+  after the loader returns, a CAS script (`casScript`) writes the result
+  only if that version is still current, otherwise it's dropped (counted
+  in `Stats().StaleWritesDropped`) and whatever's already there is left
+  alone. Because the version is a counter redis itself increments, not a
+  timestamp either side computes locally, this is immune to clock skew
+  between instances. The loader's result is still returned to its own
   caller either way, only the cache write is skipped. If caching the
   loaded value afterward fails outright (a redis error, not a staleness
   rejection), the loaded value is still returned, the loader already did
@@ -261,76 +275,95 @@ nothing shared to corrupt.
 
 ## Benchmarks
 
-Run with `make bench` (`go test -bench . -benchmem`, default `-benchtime`),
-against an in-process miniredis instance, no real network hop, so these
-are a lower bound on how much redis actually costs relative to the local
-tier; a real network round trip only widens the gap. Point `REDIS_ADDR` at
-a real redis instance for numbers that include one (`make bench
-REDIS_ADDR=host:port`).
+Run with `make bench` (`go test -bench . -benchmem`, default `-benchtime`).
+By default that's against an in-process miniredis instance, which is
+convenient for the test suite but a poor stand-in for these specific
+numbers: `Set`, `Invalidate`, and `GetOrLoad`'s write path now run a
+small Lua script in redis (see "How it works" above), and miniredis's
+Lua support is a pure-Go VM that spins up fresh per call, at a few
+hundred allocations each, dwarfing everything else being measured. Real
+redis runs that same script server-side, where it costs about what any
+other command does. The numbers below are from a real redis instead
+(`make bench REDIS_ADDR=host:port`, here a local `redis:7-alpine`
+container), to actually show that.
+
+To get your own redis instance and reproduce them:
+
+```
+docker run -d --rm --name strata-bench-redis -p 16379:6379 redis:7-alpine
+make bench REDIS_ADDR=127.0.0.1:16379
+docker stop strata-bench-redis
+```
+
+Any redis reachable from this machine works, not just a local container,
+point `REDIS_ADDR` at it the same way. Run it a couple of times, `ns/op`
+moves around with whatever else is on the box and the network path to
+redis; the allocation counts shouldn't, they're deterministic given the
+code, and are the numbers worth actually comparing against what's below.
 
 ```
 goos: linux
 goarch: amd64
 cpu: AMD Ryzen 7 PRO 4750U with Radeon Graphics
 
-BenchmarkRedisOnly/Set-16                       33836    73873 ns/op    1464 B/op    34 allocs/op
-BenchmarkRedisOnly/Get-16                       36134    67178 ns/op     456 B/op    18 allocs/op
-BenchmarkRedisOnly/GetParallel-16               573189     3523 ns/op     472 B/op    18 allocs/op
+BenchmarkRedisOnly/Set-16                      32000    97041 ns/op    328 B/op     9 allocs/op
+BenchmarkRedisOnly/Get-16                      17204   117757 ns/op    280 B/op     6 allocs/op
+BenchmarkRedisOnly/GetParallel-16             184051    13222 ns/op    280 B/op     6 allocs/op
 
-BenchmarkLocalOnly/Set-16                      3343795      833 ns/op     211 B/op     6 allocs/op
-BenchmarkLocalOnly/Get-16                     39536169       61 ns/op       0 B/op     0 allocs/op
-BenchmarkLocalOnly/GetParallel-16            316830915        8 ns/op       0 B/op     0 allocs/op
+BenchmarkLocalOnly/Set-16                    3283226      795 ns/op    211 B/op     6 allocs/op
+BenchmarkLocalOnly/Get-16                   39953786       59 ns/op      0 B/op     0 allocs/op
+BenchmarkLocalOnly/GetParallel-16          344854586        7 ns/op      0 B/op     0 allocs/op
 
-BenchmarkTieredCache/Set-16                      16848   152709 ns/op    2677 B/op    63 allocs/op
-BenchmarkTieredCache/GetWarmLocal-16          35956658       66 ns/op       0 B/op     0 allocs/op
-BenchmarkTieredCache/GetColdLocal-16             33204    69898 ns/op     685 B/op    24 allocs/op
-BenchmarkTieredCache/GetWarmLocalParallel-16 141168278       17 ns/op       0 B/op     0 allocs/op
-BenchmarkTieredCache/GetOrLoad-16             34539559       68 ns/op       0 B/op     0 allocs/op
+BenchmarkTieredCache/Set-16                    10000   245527 ns/op   1077 B/op    29 allocs/op
+BenchmarkTieredCache/GetWarmLocal-16        36208272       67 ns/op      0 B/op     0 allocs/op
+BenchmarkTieredCache/GetColdLocal-16           17598   118104 ns/op    519 B/op    12 allocs/op
+BenchmarkTieredCache/GetWarmLocalParallel-16 137394918    18 ns/op      0 B/op     0 allocs/op
+BenchmarkTieredCache/GetOrLoad-16           34781181       70 ns/op      0 B/op     0 allocs/op
 
-BenchmarkTieredCache/GetOrLoadContended-16         669  3646355 ns/op  227642 B/op  2107 allocs/op
-                                                         1.000 loader-calls/round
-BenchmarkTieredCache/GetOrLoadContendedNoDedup-16  650  3539056 ns/op   94317 B/op  3242 allocs/op
-                                                        31.96 loader-calls/round
+BenchmarkTieredCache/GetOrLoadContended-16        568  4107398 ns/op  23234 B/op   970 allocs/op
+                                                        1.000 loader-calls/round
+BenchmarkTieredCache/GetOrLoadContendedNoDedup-16 459  5076820 ns/op  57950 B/op  1832 allocs/op
+                                                       32.00 loader-calls/round
 
-BenchmarkGetOrLoad_Generic/Set-16                 3838   731769 ns/op  202976 B/op   892 allocs/op
-BenchmarkGetOrLoad_Generic/GetWarmLocal-16     1898338     1198 ns/op      80 B/op     2 allocs/op
-BenchmarkGetOrLoad_Generic/GetWarmLocalParallel-16 19671957 125 ns/op     80 B/op     2 allocs/op
-BenchmarkWithCache-16                           1393260     1768 ns/op     152 B/op     4 allocs/op
+BenchmarkGetOrLoad_Generic/Set-16                4918   596327 ns/op   2563 B/op    97 allocs/op
+BenchmarkGetOrLoad_Generic/GetWarmLocal-16    2304787      978 ns/op     80 B/op     2 allocs/op
+BenchmarkGetOrLoad_Generic/GetWarmLocalParallel-16 18019952 128 ns/op   80 B/op     2 allocs/op
+BenchmarkWithCache-16                         1672387     1376 ns/op    152 B/op     4 allocs/op
 ```
 
 **What these say:**
 
-- **A warm local read is ~66ns in `TieredCache`, ~61ns in `LocalOnly`.**
+- **A warm local read is ~67ns in `TieredCache`, ~59ns in `LocalOnly`.**
   Tiering costs almost nothing once a key is promoted. Compare that to
-  `~67µs` for a plain redis `Get`: roughly **1,000x** faster, even against
-  miniredis with no real network involved.
-- **`GetColdLocal` (70µs) tracks the raw redis `Get` (67µs) closely.** The
-  local-miss check is cheap, so falling back to redis costs exactly one
-  round trip, no hidden tiering tax.
-- **Parallel redis reads drop to ~3.5µs.** Connection-pool overlap
+  `~118µs` for a plain redis `Get` over a real connection: roughly
+  **1,750x** faster.
+- **`GetColdLocal` (118µs) tracks the raw redis `Get` (118µs) exactly.**
+  The local-miss check is cheap, so falling back to redis costs exactly
+  one round trip, no hidden tiering tax.
+- **Parallel redis reads drop to ~13µs.** Connection-pool overlap
   amortizing round-trip latency across goroutines, not redis getting
-  faster per call. `LocalOnly`'s parallel warm read drops further, to
-  ~8ns, `sync.Map`'s lock-free read path doing what it's for.
-  `TieredCache`'s parallel warm read is ~17ns, roughly 2x `LocalOnly`'s:
+  faster per call. `LocalOnly`'s parallel warm read drops much further,
+  to ~7ns, `sync.Map`'s lock-free read path doing what it's for.
+  `TieredCache`'s parallel warm read is ~18ns, roughly 2.5x `LocalOnly`'s:
   the difference is `Stats`'s atomic counters contending with each other
   under 16-way parallelism, a measured, accepted cost of leaving
   hit/miss/error counting on by default, not a free lunch.
+- **`Set` (245µs, 29 allocs) costs about 2.5x a plain redis `Set` (97µs,
+  9 allocs).** That's the version-bumping Lua script plus the
+  invalidation publish, both real redis round trips on top of the local
+  write, not free, but nowhere near the hundreds of allocations the same
+  benchmark shows under miniredis.
 - **`GetOrLoadContended` proves the singleflight dedup**: 32 goroutines
   racing a cold key produce exactly **1.000 loader calls per round**,
-  versus **31.96** without it (`GetOrLoadContendedNoDedup`). That's the
+  versus **32.00** without it (`GetOrLoadContendedNoDedup`), and roughly
+  half the allocations per round too (970 vs 1832). That's the
   thundering-herd protection actually measured, not just asserted.
-  `GetOrLoadContended`'s own allocations look heavy in this table (a
-  single real write per round costs more than the 32 reads around it),
-  that's miniredis's pure-Go Lua interpreter spinning up a VM for
-  `setIfNewer`'s CAS script, not something a real redis server would cost
-  a client: there, script execution happens server-side, and the
-  client-side cost is comparable to any other command.
 - **The generic helpers cost what JSON marshaling costs**, not what the
-  cache costs, on the warm path: `GetOrLoad[T]`'s is ~1.2µs and
-  `WithCache`'s is ~1.77µs, both dominated by `encoding/json`, not the
-  ~60ns cache lookup underneath them. `GetOrLoad_Generic/Set` (~730µs,
-  always a cold key) additionally pays the same miniredis Lua cost as
-  `GetOrLoadContended` above, on top of marshaling.
+  cache costs, on the warm path: `GetOrLoad[T]`'s is ~1µs and
+  `WithCache`'s is ~1.4µs, both dominated by `encoding/json`, not the
+  ~60ns cache lookup underneath them. `GetOrLoad_Generic/Set` (~596µs,
+  always a cold key) is dominated by the same cold-write round trips as
+  `TieredCache/Set` above, plus marshaling.
 
 ## Development
 

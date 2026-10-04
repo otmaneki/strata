@@ -348,10 +348,9 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 	switch {
 	case err == nil:
 		tc.stats.redisHits.Add(1)
-		data := stripVersion(val)
-		decoded := data
+		decoded := val
 		if tc.codec != nil {
-			decoded, err = tc.codec.Decode(data)
+			decoded, err = tc.codec.Decode(val)
 			if err != nil {
 				tc.stats.decodeErrors.Add(1)
 				tc.observer.OnDecodeError(err)
@@ -391,9 +390,10 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 // Set writes value under key to whichever tiers are enabled. The local
 // tier stores its own copy of value, so it's safe to mutate or reuse
 // value (e.g. a buffer pulled from a sync.Pool) after Set returns. If a
-// Codec is configured, the redis tier stores the encoded form instead,
-// tagged with the current time so a slower concurrent write never
-// clobbers it, see setIfNewer's doc comment.
+// Codec is configured, the redis tier stores the encoded form instead.
+// The redis write also bumps key's version counter, a separate redis key
+// that setIfVersion later checks, see its doc comment and
+// versionKeyPrefix's.
 // If both tiers are enabled, it also publishes an invalidation, the same
 // one Invalidate sends, so other nodes subscribed via
 // SubscribeInvalidations drop their now-stale local copy instead of
@@ -402,10 +402,7 @@ func (tc *TieredCache) Get(ctx context.Context, key string) ([]byte, bool) {
 // that never happened would be misleading.
 //
 // Set itself always applies, regardless of ordering: it's an explicit
-// request to store this value now, not a conditional one. The version tag
-// exists so a later GetOrLoad call, specifically one whose loader was
-// already running when this Set happened, can tell its own result is now
-// stale and avoid overwriting what Set just wrote.
+// request to store this value now, not a conditional one.
 func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error {
 	if tc.localEnabled {
 		// A defensive copy: value may be a buffer the caller reuses (e.g.
@@ -435,8 +432,9 @@ func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error 
 		toStore = encoded
 	}
 
+	ttlMillis := int64(tc.remoteTTL / time.Millisecond)
 	redisStart := tc.startRedisTimer()
-	err := tc.redis.Set(ctx, key, versionedPayload(time.Now().UnixNano(), toStore), tc.remoteTTL).Err()
+	err := setScript.Run(ctx, tc.redis, []string{key, versionKey(key)}, toStore, ttlMillis).Err()
 	tc.observeRedisLatency(redisStart)
 	if err != nil {
 		return err
@@ -454,6 +452,12 @@ func (tc *TieredCache) Set(ctx context.Context, key string, value []byte) error 
 // returns before publishing if the redis delete itself fails, since
 // announcing an invalidation for a key that's still live in redis would be
 // misleading.
+//
+// The redis delete also bumps key's version counter, atomically with the
+// delete: a setIfVersion call already in flight for this key, holding a
+// version captured before this Invalidate, must see that something
+// changed and refuse to resurrect the value it was about to write, not
+// silently undo the invalidation.
 func (tc *TieredCache) Invalidate(ctx context.Context, key string) error {
 	if tc.localEnabled {
 		localStart := tc.startLocalTimer()
@@ -466,7 +470,7 @@ func (tc *TieredCache) Invalidate(ctx context.Context, key string) error {
 	}
 
 	delStart := tc.startRedisTimer()
-	err := tc.redis.Del(ctx, key).Err()
+	err := delScript.Run(ctx, tc.redis, []string{key, versionKey(key)}).Err()
 	tc.observeRedisLatency(delStart)
 	if err != nil {
 		return fmt.Errorf("delete %s from redis: %w", key, err)
@@ -537,12 +541,22 @@ func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ct
 			return val, nil
 		}
 
-		// Recorded before the loader runs, not after: the loader can be
-		// slow, and if a Set for this key lands while it's still running,
-		// that Set's version will be newer. Stamping the load's version
-		// from before it started, rather than after it finished, is what
-		// lets setIfNewer tell the two apart and reject the stale one.
-		loadStart := time.Now().UnixNano()
+		// Captured before the loader runs, not after: the loader can be
+		// slow, and if a Set, Invalidate, or another GetOrLoad touches
+		// this key while it's still running, key's version counter will
+		// have moved on by the time the loader returns. Capturing the
+		// baseline from before the load started, rather than after it
+		// finished, is what lets setIfVersion tell the two apart and
+		// reject the stale one. A failure here doesn't abort the load,
+		// the caller still wants their data, it just means there's no
+		// baseline to check later, so the cache write afterward is
+		// skipped instead of risked.
+		var expectedVersion int64
+		var versionErr error
+		if tc.remoteEnabled {
+			expectedVersion, versionErr = tc.currentVersion(ctx, key)
+		}
+
 		val, err := loader(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("loader for key %s: %w", key, err)
@@ -552,22 +566,29 @@ func (tc *TieredCache) GetOrLoad(ctx context.Context, key string, loader func(ct
 		// good, so a cache-population failure shouldn't fail this call
 		// too. Report it via the observer instead of the return value,
 		// see Observer.OnSetError's doc comment.
-		if tc.remoteEnabled {
-			// setIfNewer, not Set: a concurrent write for this key that
+		switch {
+		case !tc.remoteEnabled:
+			// WithoutRedis has no concurrent writer to race against,
+			// local tier writes are already last-write-wins there, so
+			// Set's plain behavior is fine.
+			if err := tc.Set(ctx, key, val); err != nil {
+				tc.stats.setErrors.Add(1)
+				tc.observer.OnSetError(fmt.Errorf("set key %s: %w", key, err))
+			}
+		case versionErr != nil:
+			tc.stats.setErrors.Add(1)
+			tc.observer.OnSetError(fmt.Errorf("read version for key %s: %w", key, versionErr))
+		default:
+			// setIfVersion, not Set: a concurrent write for this key that
 			// completed while the loader was still running must win, see
-			// its doc comment. WithoutRedis has no such concurrent writer
-			// to race against, local tier writes are already
-			// last-write-wins there, so Set's plain behavior is fine.
-			switch applied, err := tc.setIfNewer(ctx, key, val, loadStart); {
+			// its doc comment.
+			switch applied, err := tc.setIfVersion(ctx, key, val, expectedVersion); {
 			case err != nil:
 				tc.stats.setErrors.Add(1)
 				tc.observer.OnSetError(fmt.Errorf("set key %s: %w", key, err))
 			case !applied:
 				tc.stats.staleWritesDropped.Add(1)
 			}
-		} else if err := tc.Set(ctx, key, val); err != nil {
-			tc.stats.setErrors.Add(1)
-			tc.observer.OnSetError(fmt.Errorf("set key %s: %w", key, err))
 		}
 
 		return val, nil

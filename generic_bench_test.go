@@ -95,7 +95,7 @@ func BenchmarkWithCache(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		if _, err := getUser(ctx, "warm"); err != nil {
 			b.Fatal(err)
 		}

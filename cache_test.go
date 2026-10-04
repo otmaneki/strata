@@ -452,7 +452,7 @@ func TestTieredCache_GetOrLoad_CopiesLoaderResult(t *testing.T) {
 // a concurrent Set for the same key completes with a fresher value. Once
 // the slow loader finally returns its now-stale result, GetOrLoad must not
 // let it clobber what the concurrent Set already wrote, there would be
-// nothing left to correct it afterward. See setIfNewer's doc comment.
+// nothing left to correct it afterward. See setIfVersion's doc comment.
 func TestTieredCache_GetOrLoad_SlowLoaderDoesNotOverwriteNewerSet(t *testing.T) {
 	tc, _ := newMiniredisTieredCache(t)
 	ctx := context.Background()
@@ -507,6 +507,64 @@ func TestTieredCache_GetOrLoad_SlowLoaderDoesNotOverwriteNewerSet(t *testing.T) 
 
 	if got := tc.Stats().StaleWritesDropped; got != 1 {
 		t.Errorf("StaleWritesDropped = %d, want 1", got)
+	}
+}
+
+// TestTieredCache_GetOrLoad_SlowLoaderDoesNotResurrectInvalidatedKey is
+// SlowLoaderDoesNotOverwriteNewerSet's counterpart for Invalidate instead
+// of Set: a slow loader's stale result must not get written back into
+// redis after the key was explicitly invalidated while the loader was
+// still running. Invalidate bumps key's version counter specifically to
+// prevent this, see its doc comment.
+func TestTieredCache_GetOrLoad_SlowLoaderDoesNotResurrectInvalidatedKey(t *testing.T) {
+	tc, _ := newMiniredisTieredCache(t)
+	ctx := context.Background()
+	const key = "key"
+
+	// Start with a real value, then force a miss the same way an
+	// upstream delete would, so GetOrLoad's loader below actually runs.
+	if err := tc.Set(ctx, key, []byte("original")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := tc.Invalidate(ctx, key); err != nil {
+		t.Fatalf("seeding: Invalidate: %v", err)
+	}
+
+	loaderStarted := make(chan struct{})
+	resumeLoader := make(chan struct{})
+	loader := func(context.Context) ([]byte, error) { //nolint:unparam // error is part of the loader signature GetOrLoad requires, this double never fails
+		close(loaderStarted)
+		<-resumeLoader
+		return []byte("stale"), nil
+	}
+
+	loadDone := make(chan struct{})
+	var loadErr error
+	go func() {
+		defer close(loadDone)
+		_, loadErr = tc.GetOrLoad(ctx, key, loader)
+	}()
+
+	<-loaderStarted
+
+	// The key is explicitly invalidated while the loader above is still
+	// running, as if whatever this cached had just been deleted upstream.
+	if err := tc.Invalidate(ctx, key); err != nil {
+		t.Fatalf("concurrent Invalidate: %v", err)
+	}
+
+	close(resumeLoader)
+	<-loadDone
+
+	if loadErr != nil {
+		t.Fatalf("GetOrLoad: %v", loadErr)
+	}
+
+	// The key must still be gone: the loader's stale result must not
+	// have resurrected it.
+	tc.local.Delete(key)
+	if _, ok := tc.Get(ctx, key); ok {
+		t.Fatal("expected a miss, the stale loader result must not have resurrected the invalidated key")
 	}
 }
 
@@ -567,7 +625,9 @@ func TestTieredCache_WithoutRedis_NeverTouchesRedis(t *testing.T) {
 // marker byte, Decode requires and strips it. This makes it possible to
 // assert, from outside the package's internals, whether a given []byte is
 // the encoded (wire) form or the decoded (original) form.
-type prefixCodec struct{ marker byte }
+type prefixCodec struct {
+	marker byte
+}
 
 func (c prefixCodec) Encode(value []byte) ([]byte, error) {
 	return append([]byte{c.marker}, value...), nil
@@ -580,6 +640,39 @@ func (c prefixCodec) Decode(data []byte) ([]byte, error) {
 	return data[1:], nil
 }
 
+// TestTieredCache_Get_DoesNotCorruptValuesWithColons proves the value
+// redis holds under a key is never wrapped with anything, version
+// information included. An earlier implementation stored a
+// "<version>:<data>" prefix directly on the value and stripped
+// everything up to the first colon on read, a scheme that corrupts any
+// legacy or foreign value containing a colon, which is most JSON:
+// {"name":"otmane"} has its own first colon seven bytes in, right after
+// "name".
+func TestTieredCache_Get_DoesNotCorruptValuesWithColons(t *testing.T) {
+	_, client := newMiniredisTieredCache(t)
+	ctx := context.Background()
+	const key = "key"
+	const legacy = `{"name":"otmane"}`
+
+	// Seed redis directly, bypassing Set entirely, the way a value
+	// written before this feature existed, or by a different service
+	// sharing this redis instance, would already be sitting there.
+	if err := client.Set(ctx, key, legacy, time.Minute).Err(); err != nil {
+		t.Fatalf("seeding redis: %v", err)
+	}
+
+	tc := NewTieredCache(client, time.Minute, time.Minute)
+	defer tc.Close() //nolint:errcheck // test cleanup
+
+	got, ok := tc.Get(ctx, key)
+	if !ok {
+		t.Fatal("expected a hit")
+	}
+	if string(got) != legacy {
+		t.Fatalf("Get = %q, want %q unchanged", got, legacy)
+	}
+}
+
 func TestTieredCache_Codec_RoundTrip(t *testing.T) {
 	tc, client := newMiniredisTieredCache(t, WithCodec(prefixCodec{marker: 0xAB}))
 	ctx := context.Background()
@@ -589,12 +682,12 @@ func TestTieredCache_Codec_RoundTrip(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	// redis should hold the ENCODED form, behind a version prefix.
-	raw, err := client.Get(ctx, key).Bytes()
+	// redis should hold the ENCODED form, exactly, with nothing else
+	// wrapped around it, see versionKeyPrefix's doc comment.
+	encoded, err := client.Get(ctx, key).Bytes()
 	if err != nil {
 		t.Fatalf("reading raw redis value: %v", err)
 	}
-	encoded := stripVersion(raw)
 	if len(encoded) == 0 || encoded[0] != 0xAB {
 		t.Fatalf("expected encoded bytes in redis, got %v", encoded)
 	}
@@ -836,7 +929,8 @@ func TestTieredCache_LatencyHistograms(t *testing.T) {
 		local := &fakeHistogram{}
 		redisHist := &fakeHistogram{}
 		pubsub := &fakeHistogram{}
-		tc, _ := newMiniredisTieredCache(t,
+		tc, _ := newMiniredisTieredCache(
+			t,
 			WithLocalLatencyHistogram(local),
 			WithRedisLatencyHistogram(redisHist),
 			WithPubSubLatencyHistogram(pubsub),
@@ -919,7 +1013,8 @@ func TestWithCache_MemoizesFunction(t *testing.T) {
 	ctx := context.Background()
 
 	calls := map[string]int{}
-	getUser := WithCache(tc, JSONMarshaler[exampleUser]{},
+	getUser := WithCache(
+		tc, JSONMarshaler[exampleUser]{},
 		func(id string) string { return "user:" + id },
 		func(_ context.Context, id string) (exampleUser, error) {
 			calls[id]++
