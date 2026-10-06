@@ -10,6 +10,7 @@ import (
 
 type entry struct {
 	value     any
+	version   uint64
 	expiresAt time.Time
 }
 

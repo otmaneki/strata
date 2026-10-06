@@ -64,6 +64,10 @@ type TieredCache struct {
 	// publish back to the publisher, and without this a node would evict
 	// its own freshly written entry on every Set.
 	instanceID string
+
+	// invalidator is the invalidation mechanism that the user wants
+	// us to use in order to publish the invalidation messages.
+	invalidator InvalidatorV2
 }
 
 // newInstanceID returns a random id for tagging this instance's published
@@ -106,6 +110,9 @@ func NewTieredCache(rc redis.UniversalClient, localTTL, remoteTTL time.Duration,
 	}
 	if tc.localEnabled {
 		tc.local = newLocalCache(tc.localCacheMaxSize, tc.localCacheEvictInterval)
+	}
+	if tc.invalidator == nil {
+		// TODO: Add the default invalidation with pub/sub here.
 	}
 	return tc
 }

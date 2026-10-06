@@ -74,3 +74,11 @@ func WithLocalLatencyHistogram(h Histogram) Option {
 func WithLoaderTimeout(timeout time.Duration) Option {
 	return func(tc *TieredCache) { tc.loaderTimeout = timeout }
 }
+
+// WithInvalidator sets the invalidation mechanism that the user wants to use
+// if it's not provided the it fallsback to the redis-pubsub
+func WithInvalidator(invalidator InvalidatorV2) Option {
+	return func(tc *TieredCache) {
+		tc.invalidator = invalidator
+	}
+}
