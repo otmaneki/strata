@@ -43,7 +43,9 @@ func newLocalCache(maxSize int, evictInterval time.Duration) *localCache {
 
 // Close stops the background TTL sweeper. Safe to call more than once.
 func (c *localCache) Close() {
-	c.stopOnce.Do(func() { close(c.stop) })
+	c.stopOnce.Do(func() {
+		close(c.stop)
+	})
 }
 
 // Get does exactly what it says.
@@ -57,12 +59,13 @@ func (c *localCache) Get(key string) (any, bool) {
 		return nil, false
 	}
 	if time.Now().After(e.expiresAt) {
-		// LoadAndDelete, not Delete: two concurrent Gets can both observe
-		// the same expired entry before either removes it. Delete alone
-		// can't tell you whether *this* call was the one that actually
-		// removed something, so decrementing unconditionally after it
-		// double-counts the eviction and drifts size negative.
-		if _, loaded := c.data.LoadAndDelete(key); loaded {
+		// CompareAndDelete, not LoadAndDelete: a concurrent Set may have
+		// replaced e with a fresh entry since the Load above, and removing
+		// by key alone would delete that instead. Only remove the exact
+		// entry observed as expired. It also reports whether this call was
+		// the one that removed it, so concurrent Gets expiring the same
+		// entry can't double-decrement size.
+		if c.data.CompareAndDelete(key, e) {
 			c.size.Add(-1)
 		}
 		return nil, false
@@ -132,15 +135,15 @@ func (c *localCache) evictLoop(interval time.Duration) {
 // access-order tracking to do better than that without giving up the
 // lock-free read path.
 func (c *localCache) evictOne(except string) {
-	c.data.Range(func(key, _ any) bool {
+	c.data.Range(func(key, value any) bool {
 		if key == except {
 			return true // keep scanning
 		}
-		// LoadAndDelete, see the comment in Get. Another goroutine (a
-		// concurrent evictOne, or an expiry in Get/sweepExpired) may have
-		// already removed this exact key between Range visiting it and us
-		// calling Delete.
-		if _, loaded := c.data.LoadAndDelete(key); loaded {
+		// CompareAndDelete against the value Range visited, see the
+		// comment in Get. If it fails, the key was replaced or removed
+		// since Range saw it: keep scanning for another victim rather
+		// than evicting whatever now lives under this key.
+		if c.data.CompareAndDelete(key, value) {
 			c.size.Add(-1)
 		}
 		return false
@@ -158,7 +161,7 @@ func (c *localCache) sweepExpired() {
 			// LoadAndDelete, see the comment in Get. A concurrent Get on
 			// this same key may be expiring and removing it at the same
 			// time.
-			if _, loaded := c.data.LoadAndDelete(key); loaded {
+			if c.data.CompareAndDelete(key, e) {
 				c.size.Add(-1)
 			}
 		}
